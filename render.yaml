@@ -5,6 +5,6 @@ services:
     plan: free
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
-    envVars:
-      - key: ALLOWED_ORIGINS
-        sync: false
+    # ALLOWED_ORIGINS defaults to "*" (safe here — auth uses bearer tokens,
+    # not cookies). Set it in the Render dashboard to lock CORS to the
+    # frontend origin once the Vercel URL is known.
