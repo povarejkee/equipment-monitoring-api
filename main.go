@@ -1,0 +1,78 @@
+package main
+
+import (
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+func main() {
+	store := NewStore()
+	auth := NewAuthManager(store)
+	hub := NewHub()
+	srv := NewServer(store, auth, hub)
+
+	// Real-time loop: advance metrics every 4s and push to WS clients.
+	go func() {
+		ticker := time.NewTicker(4 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			hub.Broadcast("machines", store.Tick())
+		}
+	}()
+
+	mux := http.NewServeMux()
+
+	// Public
+	mux.HandleFunc("POST /api/auth/login", srv.handleLogin)
+	mux.HandleFunc("GET /api/health", srv.handleHealth)
+	mux.HandleFunc("GET /ws", srv.handleWS)
+
+	// Protected
+	mux.HandleFunc("GET /api/auth/me", srv.authMiddleware(srv.handleMe))
+	mux.HandleFunc("GET /api/machines", srv.authMiddleware(srv.handleMachines))
+	mux.HandleFunc("GET /api/machines/{id}", srv.authMiddleware(srv.handleMachine))
+	mux.HandleFunc("GET /api/machines/{id}/history", srv.authMiddleware(srv.handleMachineHistory))
+	mux.HandleFunc("GET /api/machines/{id}/downtimes", srv.authMiddleware(srv.handleMachineDowntimes))
+	mux.HandleFunc("GET /api/machines/{id}/alerts", srv.authMiddleware(srv.handleMachineAlerts))
+	mux.HandleFunc("GET /api/alerts", srv.authMiddleware(srv.handleAlerts))
+	mux.HandleFunc("POST /api/alerts/acknowledge-all", srv.authMiddleware(srv.handleAcknowledgeAll))
+	mux.HandleFunc("POST /api/alerts/{id}/acknowledge", srv.authMiddleware(srv.handleAcknowledgeAlert))
+	mux.HandleFunc("GET /api/thresholds", srv.authMiddleware(srv.handleThresholds))
+	mux.HandleFunc("PUT /api/thresholds", srv.authMiddleware(srv.handleUpdateThreshold))
+	mux.HandleFunc("GET /api/errors", srv.authMiddleware(srv.handleErrors))
+	mux.HandleFunc("POST /api/reports", srv.authMiddleware(srv.handleReport))
+	mux.HandleFunc("GET /api/users", srv.authMiddleware(srv.handleUsers))
+
+	var allowed []string
+	if raw := os.Getenv("ALLOWED_ORIGINS"); raw != "" {
+		for _, o := range strings.Split(raw, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				allowed = append(allowed, o)
+			}
+		}
+	}
+	handler := corsMiddleware(allowed, mux)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Printf("Equipment Monitoring API listening on :%s (origins: %v)", port, originsLabel(allowed))
+	log.Fatal(server.ListenAndServe())
+}
+
+func originsLabel(allowed []string) string {
+	if len(allowed) == 0 {
+		return "*"
+	}
+	return strings.Join(allowed, ",")
+}

@@ -1,0 +1,8 @@
+# Binaries
+/api
+*.exe
+*.out
+em-api
+
+# OS
+.DS_Store

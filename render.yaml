@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: equipment-monitoring-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: ALLOWED_ORIGINS
+        sync: false
