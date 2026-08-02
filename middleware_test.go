@@ -6,8 +6,9 @@ import (
 	"testing"
 )
 
-func newTestServer() (*Server, string) {
-	store := NewStore()
+func newTestServer(t *testing.T) (*Server, string) {
+	t.Helper()
+	store := NewStore(requireTestDB(t))
 	auth := NewAuthManager(store)
 	srv := NewServer(store, auth, NewHub())
 	_, token, _ := auth.Login("admin@demo.com", "demo")
@@ -15,7 +16,7 @@ func newTestServer() (*Server, string) {
 }
 
 func TestAuthMiddleware_NoToken(t *testing.T) {
-	srv, _ := newTestServer()
+	srv, _ := newTestServer(t)
 	called := false
 	h := srv.authMiddleware(func(w http.ResponseWriter, r *http.Request) { called = true })
 
@@ -31,7 +32,7 @@ func TestAuthMiddleware_NoToken(t *testing.T) {
 }
 
 func TestAuthMiddleware_InvalidToken(t *testing.T) {
-	srv, _ := newTestServer()
+	srv, _ := newTestServer(t)
 	h := srv.authMiddleware(func(w http.ResponseWriter, r *http.Request) {})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/machines", nil)
@@ -45,7 +46,7 @@ func TestAuthMiddleware_InvalidToken(t *testing.T) {
 }
 
 func TestAuthMiddleware_ValidToken(t *testing.T) {
-	srv, token := newTestServer()
+	srv, token := newTestServer(t)
 	var gotUser *User
 	h := srv.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		gotUser = userFromContext(r)
@@ -66,7 +67,7 @@ func TestAuthMiddleware_ValidToken(t *testing.T) {
 }
 
 func TestAuthMiddleware_ValidToken_WSQueryParam(t *testing.T) {
-	srv, token := newTestServer()
+	srv, token := newTestServer(t)
 	h := srv.authMiddleware(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	req := httptest.NewRequest(http.MethodGet, "/ws?token="+token, nil)

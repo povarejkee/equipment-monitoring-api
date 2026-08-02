@@ -1,3 +1,9 @@
+databases:
+  - name: equipment-monitoring-db
+    plan: free
+    databaseName: equipment_monitoring
+    user: equipment_monitoring
+
 services:
   - type: web
     name: equipment-monitoring-api
@@ -10,3 +16,7 @@ services:
       # for local dev — the server logs a warning if this isn't set.
       - key: ALLOWED_ORIGINS
         value: https://browser-two-teal.vercel.app
+      - key: DATABASE_URL
+        fromDatabase:
+          name: equipment-monitoring-db
+          property: connectionString

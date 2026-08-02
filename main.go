@@ -1,14 +1,36 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	appdb "equipment-monitoring-api/internal/db"
 )
 
 func main() {
-	store := NewStore()
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		logger.Error("DATABASE_URL is not set")
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	pool, err := appdb.Connect(ctx, databaseURL)
+	if err != nil {
+		logger.Error("database connection failed", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	if err := appdb.Migrate(ctx, pool); err != nil {
+		logger.Error("migration failed", "error", err)
+		os.Exit(1)
+	}
+
+	store := NewStore(pool)
 	auth := NewAuthManager(store)
 	hub := NewHub()
 	srv := NewServer(store, auth, hub)
