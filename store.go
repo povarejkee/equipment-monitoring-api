@@ -19,11 +19,9 @@ import (
 
 // Store is the PostgreSQL-backed data layer. Demo data is no longer
 // generated here at startup — see cmd/seed for that; this only reads and
-// writes the DB. rng is kept for the parts that still simulate readings
-// that don't exist in the real world yet: Tick() (no real sensors) and
-// GenerateReport/buildTimeSeries's placeholder numbers (real aggregation
-// lands separately). rngMu guards it since Tick() runs on a ticker
-// goroutine concurrently with HTTP handlers.
+// writes the DB. rng simulates readings that don't exist in the real
+// world (no real sensors): only Tick() uses it now. rngMu guards it since
+// Tick() runs on a ticker goroutine concurrently with HTTP handlers.
 type Store struct {
 	pool  *pgxpool.Pool
 	rng   *rand.Rand
@@ -523,11 +521,14 @@ func isUniqueViolation(err error) bool {
 
 // ── Reports ──────────────────────────────────────────────────────────
 //
-// Numbers here are still simulated (s.rng), matching pre-DB behavior — the
-// swap to real aggregation from metric_history/downtimes is a separate,
-// dedicated change. Only the machine list now comes from Postgres.
+// Aggregated from metric_history/error_log/downtimes for the requested
+// period — no more randomized placeholders. Efficiency has no directly
+// stored source, so it's derived as uptime minus a small penalty per
+// error (0.5pp each, floored at 0) — a documented heuristic, not a raw
+// simulated number.
 
 func (s *Store) GenerateReport(p ReportParams) ReportData {
+	ctx := context.Background()
 	machines := s.Machines()
 	filtered := make([]*Machine, 0)
 	for _, m := range machines {
@@ -535,22 +536,52 @@ func (s *Store) GenerateReport(p ReportParams) ReportData {
 			filtered = append(filtered, m)
 		}
 	}
+	machineIDs := make([]string, len(filtered))
+	for i, m := range filtered {
+		machineIDs[i] = m.ID
+	}
 
-	s.rngMu.Lock()
+	periodMinutes := p.DateTo.Sub(p.DateFrom).Minutes()
+
 	breakdown := make([]MachineReportRow, 0, len(filtered))
 	for _, m := range filtered {
+		var totalOutput, downtimeMinutes float64
+		var errorCount int
+		err := s.pool.QueryRow(ctx, `WITH mh AS (
+				SELECT COALESCE(SUM(output), 0) AS total_output FROM metric_history
+				WHERE machine_id=$1 AND timestamp >= $2 AND timestamp <= $3
+			), errs AS (
+				SELECT COUNT(*) AS cnt FROM error_log
+				WHERE machine_id=$1 AND timestamp >= $2 AND timestamp <= $3
+			), dt AS (
+				SELECT COALESCE(SUM(duration), 0) AS minutes FROM downtimes
+				WHERE machine_id=$1 AND start_time >= $2 AND start_time <= $3
+			)
+			SELECT mh.total_output, errs.cnt, dt.minutes FROM mh, errs, dt`,
+			m.ID, p.DateFrom, p.DateTo,
+		).Scan(&totalOutput, &errorCount, &downtimeMinutes)
+		if err != nil {
+			logger.Error("report: query machine aggregates", "error", err, "machineId", m.ID)
+		}
+
+		uptimePercent := 100.0
+		if periodMinutes > 0 {
+			uptimePercent = clamp(100*(1-downtimeMinutes/periodMinutes), 0, 100)
+		}
+		efficiency := clamp(uptimePercent-float64(errorCount)*0.5, 0, 100)
+
 		breakdown = append(breakdown, MachineReportRow{
 			MachineID:     m.ID,
 			MachineName:   m.Name,
-			TotalOutput:   math.Round(200 + s.rng.Float64()*800),
-			UptimePercent: round1(75 + s.rng.Float64()*20),
-			DowntimeHours: round1(1 + s.rng.Float64()*8),
-			ErrorCount:    int(math.Round(s.rng.Float64() * 5)),
-			Efficiency:    round1(70 + s.rng.Float64()*25),
+			TotalOutput:   math.Round(totalOutput),
+			UptimePercent: round1(uptimePercent),
+			DowntimeHours: round1(downtimeMinutes / 60),
+			ErrorCount:    errorCount,
+			Efficiency:    round1(efficiency),
 		})
 	}
-	timeSeries := s.buildTimeSeries(p)
-	s.rngMu.Unlock()
+
+	timeSeries := s.buildTimeSeries(ctx, p, machineIDs)
 
 	var totalOutput, sumUptime, totalDowntime, sumEff float64
 	var totalErrors int
@@ -580,21 +611,111 @@ func (s *Store) GenerateReport(p ReportParams) ReportData {
 	}
 }
 
-// buildTimeSeries must be called with rngMu already held.
-func (s *Store) buildTimeSeries(p ReportParams) []TimeSeriesPoint {
+// buildTimeSeries buckets metric_history/error_log into p.GroupBy-sized
+// windows starting at p.DateFrom (matching the original bucketing, which
+// isn't calendar-aligned). Uptime per bucket is derived from downtime
+// overlap rather than stored directly.
+func (s *Store) buildTimeSeries(ctx context.Context, p ReportParams, machineIDs []string) []TimeSeriesPoint {
 	step := stepDuration(p.GroupBy)
+	downtimes := s.downtimesInRange(ctx, machineIDs, p.DateFrom, p.DateTo)
+	numMachines := len(machineIDs)
+
 	points := make([]TimeSeriesPoint, 0)
 	for t := p.DateFrom; !t.After(p.DateTo); t = t.Add(step) {
+		bucketEnd := t.Add(step)
+
+		var output, avgTemp, avgLoad float64
+		var errCount int
+		err := s.pool.QueryRow(ctx, `WITH mh AS (
+				SELECT COALESCE(SUM(output), 0) AS output, COALESCE(AVG(temperature), 0) AS avg_temp,
+					COALESCE(AVG(load), 0) AS avg_load
+				FROM metric_history WHERE machine_id = ANY($1) AND timestamp >= $2 AND timestamp < $3
+			), errs AS (
+				SELECT COUNT(*) AS cnt FROM error_log
+				WHERE machine_id = ANY($1) AND timestamp >= $2 AND timestamp < $3
+			)
+			SELECT mh.output, mh.avg_temp, mh.avg_load, errs.cnt FROM mh, errs`,
+			machineIDs, t, bucketEnd,
+		).Scan(&output, &avgTemp, &avgLoad, &errCount)
+		if err != nil {
+			logger.Error("report: query bucket aggregates", "error", err)
+		}
+
+		uptime := 100.0
+		if bucketMinutes := bucketEnd.Sub(t).Minutes(); numMachines > 0 && bucketMinutes > 0 {
+			downtimeMinutes := overlapMinutes(downtimes, t, bucketEnd)
+			uptime = clamp(100*(1-downtimeMinutes/(bucketMinutes*float64(numMachines))), 0, 100)
+		}
+
 		points = append(points, TimeSeriesPoint{
 			Timestamp:      t,
-			Output:         math.Round(100 + s.rng.Float64()*300),
-			Uptime:         round1(70 + s.rng.Float64()*25),
-			AvgTemperature: round1(50 + s.rng.Float64()*30),
-			AvgLoad:        round1(40 + s.rng.Float64()*40),
-			ErrorCount:     s.rng.Intn(4),
+			Output:         math.Round(output),
+			Uptime:         round1(uptime),
+			AvgTemperature: round1(avgTemp),
+			AvgLoad:        round1(avgLoad),
+			ErrorCount:     errCount,
 		})
 	}
 	return points
+}
+
+type downtimeInterval struct {
+	start, end time.Time
+}
+
+// downtimesInRange fetches downtimes overlapping [from, to) for the given
+// machines once, so per-bucket uptime can be computed in Go instead of
+// re-querying per bucket.
+func (s *Store) downtimesInRange(ctx context.Context, machineIDs []string, from, to time.Time) []downtimeInterval {
+	if len(machineIDs) == 0 {
+		return nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT start_time, end_time FROM downtimes
+		WHERE machine_id = ANY($1) AND start_time < $3 AND (end_time IS NULL OR end_time > $2)`,
+		machineIDs, from, to)
+	if err != nil {
+		logger.Error("report: query downtimes", "error", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var out []downtimeInterval
+	for rows.Next() {
+		var start time.Time
+		var end *time.Time
+		if err := rows.Scan(&start, &end); err != nil {
+			logger.Error("report: scan downtime interval", "error", err)
+			continue
+		}
+		e := to // treat a still-open downtime as ongoing through the window
+		if end != nil {
+			e = *end
+		}
+		out = append(out, downtimeInterval{start: start, end: e})
+	}
+	return out
+}
+
+// overlapMinutes sums how many minutes of [from, to) each interval covers.
+func overlapMinutes(intervals []downtimeInterval, from, to time.Time) float64 {
+	var total float64
+	for _, iv := range intervals {
+		start, end := iv.start, iv.end
+		if start.Before(from) {
+			start = from
+		}
+		if end.After(to) {
+			end = to
+		}
+		if end.After(start) {
+			total += end.Sub(start).Minutes()
+		}
+	}
+	return total
+}
+
+func clamp(v, min, max float64) float64 {
+	return math.Min(max, math.Max(min, v))
 }
 
 func stepDuration(groupBy string) time.Duration {

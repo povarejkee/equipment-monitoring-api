@@ -44,9 +44,9 @@ Env vars:
   Postgres plan resets).
 - `Store` (`store.go`) is the only thing that talks to the DB; handlers
   never touch SQL directly.
-- Report numbers (`GenerateReport`/`buildTimeSeries`) are still simulated
-  placeholders, not aggregated from `metric_history`/`downtimes` yet — real
-  aggregation is a separate change.
+- Report numbers (`GenerateReport`/`buildTimeSeries`) are aggregated from
+  `metric_history`, `error_log`, and `downtimes` for the requested period
+  — see "Reports" below.
 
 ## Auth
 
@@ -80,6 +80,21 @@ skip cleanly without it — `TestMain` truncates and reseeds `users` (with a
 bcrypt hash of the demo password) before each such test for isolation.
 Key-logic coverage is 90-100% on these units; whole-package coverage is
 lower since handlers/hub/seeding aren't unit-tested.
+
+## Reports
+
+`POST /api/reports` aggregates real data for `[dateFrom, dateTo]`, bucketed
+by `groupBy` (`hour`/`day`/`week`/`month`, default `day`) starting at
+`dateFrom` (buckets aren't calendar-aligned):
+
+- **Output** — `SUM(output)` from `metric_history`.
+- **AvgTemperature`/`AvgLoad`** — `AVG(...)` from `metric_history`.
+- **ErrorCount** — `COUNT(*)` from `error_log`.
+- **Uptime/UptimePercent** — `100 * (1 - downtime_minutes / window_minutes)`,
+  where downtime is computed from `downtimes` interval overlap with the
+  window (done in Go over one query per report, not per bucket).
+- **Efficiency** — has no directly stored source, so it's a documented
+  heuristic: uptime minus 0.5 percentage points per error, floored at 0.
 
 ## Logging
 
