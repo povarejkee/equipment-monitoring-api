@@ -36,6 +36,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	user, token, ok := s.auth.Login(req.Email, req.Password)
 	if !ok {
+		logger.Warn("failed login attempt", "email", req.Email, "ip", clientIP(r))
 		writeError(w, http.StatusUnauthorized, "Неверный email или пароль")
 		return
 	}

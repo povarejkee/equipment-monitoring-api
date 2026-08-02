@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -56,9 +55,9 @@ func main() {
 		}
 	}
 	if len(allowed) == 0 {
-		log.Printf("WARNING: ALLOWED_ORIGINS is not set — CORS is wide open (*). Set it to the frontend origin in production.")
+		logger.Warn("ALLOWED_ORIGINS is not set — CORS is wide open (*); set it to the frontend origin in production")
 	}
-	handler := corsMiddleware(allowed, mux)
+	handler := recoverMiddleware(corsMiddleware(allowed, mux))
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -70,8 +69,11 @@ func main() {
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("Equipment Monitoring API listening on :%s (origins: %v)", port, originsLabel(allowed))
-	log.Fatal(server.ListenAndServe())
+	logger.Info("server starting", "port", port, "origins", originsLabel(allowed))
+	if err := server.ListenAndServe(); err != nil {
+		logger.Error("server stopped", "error", err)
+		os.Exit(1)
+	}
 }
 
 func originsLabel(allowed []string) string {

@@ -22,6 +22,13 @@ Env vars:
 - `POST /api/auth/login` is rate-limited to 5 attempts/minute per IP
   (sliding window, in-memory). Over the limit → `429`.
 
+## Logging
+
+Structured JSON logs via `log/slog` (stdout). Logged: server start/stop,
+failed login attempts (email + IP), WS upgrade failures, recovered panics
+(with stack trace). A top-level `recoverMiddleware` catches panics from any
+handler and returns `500` instead of crashing the process.
+
 ## Endpoints
 
 | Method | Path | Auth | Purpose |

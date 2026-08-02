@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"runtime/debug"
 	"strings"
 )
 
@@ -37,6 +38,25 @@ func corsMiddleware(allowed []string, next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// recoverMiddleware catches panics from downstream handlers so one bad
+// request can't take the whole server down, and logs them with a stack
+// trace instead of letting net/http print to stderr and close the conn.
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Error("panic recovered",
+					"error", rec,
+					"path", r.URL.Path,
+					"stack", string(debug.Stack()),
+				)
+				writeError(w, http.StatusInternalServerError, "Внутренняя ошибка сервера")
+			}
+		}()
 		next.ServeHTTP(w, r)
 	})
 }

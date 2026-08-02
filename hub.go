@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -37,7 +36,7 @@ func NewHub() *Hub {
 func (h *Hub) HandleWS(w http.ResponseWriter, r *http.Request, initial []*Machine) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("ws upgrade failed: %v", err)
+		logger.Error("ws upgrade failed", "error", err)
 		return
 	}
 	h.mu.Lock()
