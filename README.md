@@ -13,7 +13,14 @@ go run .
 
 Env vars:
 - `PORT` — HTTP port (default `8080`)
-- `ALLOWED_ORIGINS` — comma-separated CORS allowlist (default `*`)
+- `ALLOWED_ORIGINS` — comma-separated CORS allowlist. Leaving it unset opens
+  CORS to `*` (fine for local dev; the server logs a warning) — production
+  (`render.yaml`) sets it explicitly to the deployed frontend origin.
+
+## Security
+
+- `POST /api/auth/login` is rate-limited to 5 attempts/minute per IP
+  (sliding window, in-memory). Over the limit → `429`.
 
 ## Endpoints
 

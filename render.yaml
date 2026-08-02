@@ -5,6 +5,8 @@ services:
     plan: free
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
-    # ALLOWED_ORIGINS defaults to "*" (safe here — auth uses bearer tokens,
-    # not cookies). Set it in the Render dashboard to lock CORS to the
-    # frontend origin once the Vercel URL is known.
+    envVars:
+      # Locked to the deployed frontend. Falling back to unset/"*" is only
+      # for local dev — the server logs a warning if this isn't set.
+      - key: ALLOWED_ORIGINS
+        value: https://browser-two-teal.vercel.app

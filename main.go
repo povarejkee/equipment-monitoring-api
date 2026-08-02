@@ -13,6 +13,7 @@ func main() {
 	auth := NewAuthManager(store)
 	hub := NewHub()
 	srv := NewServer(store, auth, hub)
+	loginLimiter := newIPRateLimiter(5, time.Minute)
 
 	// Real-time loop: advance metrics every 4s and push to WS clients.
 	go func() {
@@ -26,7 +27,7 @@ func main() {
 	mux := http.NewServeMux()
 
 	// Public
-	mux.HandleFunc("POST /api/auth/login", srv.handleLogin)
+	mux.HandleFunc("POST /api/auth/login", rateLimitMiddleware(loginLimiter, srv.handleLogin))
 	mux.HandleFunc("GET /api/health", srv.handleHealth)
 	mux.HandleFunc("GET /ws", srv.handleWS)
 
@@ -53,6 +54,9 @@ func main() {
 				allowed = append(allowed, o)
 			}
 		}
+	}
+	if len(allowed) == 0 {
+		log.Printf("WARNING: ALLOWED_ORIGINS is not set — CORS is wide open (*). Set it to the frontend origin in production.")
 	}
 	handler := corsMiddleware(allowed, mux)
 
