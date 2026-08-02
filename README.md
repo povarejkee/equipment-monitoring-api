@@ -22,6 +22,22 @@ Env vars:
 - `POST /api/auth/login` is rate-limited to 5 attempts/minute per IP
   (sliding window, in-memory). Over the limit → `429`.
 
+## Tests
+
+```bash
+go test ./... -cover
+```
+
+Covers `auth.go` (login, unknown/wrong password, token resolution, token
+expiry), `store.go`'s `updateStatus` (status transitions from
+temperature/load/vibration), and `middleware.go` (`authMiddleware`,
+`corsMiddleware`). Key-logic coverage is 90-100% on those units; whole-package
+coverage is lower since handlers/hub/demo-data generation aren't unit-tested.
+
+Bearer tokens now carry a 24h TTL (in-memory) instead of never expiring —
+minimal groundwork so expiry is testable; full JWT/DB-session auth is a
+separate, larger change.
+
 ## Logging
 
 Structured JSON logs via `log/slog` (stdout). Logged: server start/stop,

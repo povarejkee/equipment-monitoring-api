@@ -6,7 +6,13 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
+
+// tokenTTL is how long a bearer token stays valid after login. Opaque
+// tokens with an in-memory TTL are a placeholder for the JWT/DB-session
+// rework (v3) — kept minimal since this whole scheme gets replaced then.
+const tokenTTL = 24 * time.Hour
 
 // credential holds the demo password for a seeded user.
 // v2 keeps the same three demo accounts as v1 so the handoff build
@@ -16,11 +22,16 @@ type credential struct {
 	userID   string
 }
 
+type tokenEntry struct {
+	userID    string
+	expiresAt time.Time
+}
+
 type AuthManager struct {
-	mu      sync.RWMutex
-	creds   map[string]credential // email -> credential
-	tokens  map[string]string     // token -> userID
-	store   *Store
+	mu     sync.RWMutex
+	creds  map[string]credential // email -> credential
+	tokens map[string]tokenEntry // token -> entry
+	store  *Store
 }
 
 func NewAuthManager(store *Store) *AuthManager {
@@ -30,7 +41,7 @@ func NewAuthManager(store *Store) *AuthManager {
 			"manager@demo.com":  {"demo", "u2"},
 			"admin@demo.com":    {"demo", "u3"},
 		},
-		tokens: make(map[string]string),
+		tokens: make(map[string]tokenEntry),
 		store:  store,
 	}
 }
@@ -53,20 +64,27 @@ func (a *AuthManager) Login(email, password string) (*User, string, bool) {
 		return nil, "", false
 	}
 	token := newToken()
-	a.tokens[token] = user.ID
+	a.tokens[token] = tokenEntry{userID: user.ID, expiresAt: time.Now().Add(tokenTTL)}
 	return user, token, true
 }
 
-// UserForToken resolves the user behind a bearer token, if any.
+// UserForToken resolves the user behind a bearer token, if any. Expired
+// tokens are treated as absent and evicted.
 func (a *AuthManager) UserForToken(token string) *User {
 	a.mu.RLock()
-	userID, ok := a.tokens[token]
+	entry, ok := a.tokens[token]
 	a.mu.RUnlock()
 	if !ok {
 		return nil
 	}
+	if time.Now().After(entry.expiresAt) {
+		a.mu.Lock()
+		delete(a.tokens, token)
+		a.mu.Unlock()
+		return nil
+	}
 	for _, u := range a.store.Users() {
-		if u.ID == userID {
+		if u.ID == entry.userID {
 			return u
 		}
 	}
