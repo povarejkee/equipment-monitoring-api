@@ -299,11 +299,29 @@ func (s *Store) generateAlerts() []*Alert {
 	return out
 }
 
-func (s *Store) Alerts() []*Alert {
+// AlertFilter narrows Alerts(); zero values mean "don't filter on this field".
+type AlertFilter struct {
+	MachineID    string
+	Severity     AlertSeverity
+	Acknowledged *bool
+}
+
+func (s *Store) Alerts(f AlertFilter) []*Alert {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]*Alert, len(s.alerts))
-	copy(out, s.alerts)
+	out := make([]*Alert, 0, len(s.alerts))
+	for _, a := range s.alerts {
+		if f.MachineID != "" && a.MachineID != f.MachineID {
+			continue
+		}
+		if f.Severity != "" && a.Severity != f.Severity {
+			continue
+		}
+		if f.Acknowledged != nil && a.Acknowledged != *f.Acknowledged {
+			continue
+		}
+		out = append(out, a)
+	}
 	return out
 }
 
@@ -409,12 +427,50 @@ func (s *Store) generateErrorLog() []*ErrorLogEntry {
 	return out
 }
 
-func (s *Store) ErrorLog() []*ErrorLogEntry {
+// ErrorLogFilter narrows ErrorLog(); zero values mean "don't filter/paginate
+// on this field" (Limit == 0 returns everything after From/To/MachineID).
+type ErrorLogFilter struct {
+	MachineID string
+	From, To  *time.Time
+	Limit     int
+	Offset    int
+}
+
+// ErrorLog returns entries matching f (already sorted newest-first) plus the
+// total match count before pagination, so callers can expose it (e.g. as a
+// response header) without the client needing a second request.
+func (s *Store) ErrorLog(f ErrorLogFilter) ([]*ErrorLogEntry, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]*ErrorLogEntry, len(s.errorLog))
-	copy(out, s.errorLog)
-	return out
+	filtered := make([]*ErrorLogEntry, 0, len(s.errorLog))
+	for _, e := range s.errorLog {
+		if f.MachineID != "" && e.MachineID != f.MachineID {
+			continue
+		}
+		if f.From != nil && e.Timestamp.Before(*f.From) {
+			continue
+		}
+		if f.To != nil && e.Timestamp.After(*f.To) {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	total := len(filtered)
+
+	if f.Offset > 0 {
+		if f.Offset >= len(filtered) {
+			filtered = nil
+		} else {
+			filtered = filtered[f.Offset:]
+		}
+	}
+	if f.Limit > 0 && f.Limit < len(filtered) {
+		filtered = filtered[:f.Limit]
+	}
+
+	out := make([]*ErrorLogEntry, len(filtered))
+	copy(out, filtered)
+	return out, total
 }
 
 // ── Users ────────────────────────────────────────────────────────────

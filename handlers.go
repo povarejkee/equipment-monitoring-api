@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 type Server struct {
@@ -83,20 +84,28 @@ func (s *Server) handleMachineDowntimes(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleMachineAlerts(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	all := s.store.Alerts()
-	out := make([]*Alert, 0)
-	for _, a := range all {
-		if a.MachineID == id {
-			out = append(out, a)
-		}
-	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, s.store.Alerts(AlertFilter{MachineID: id}))
 }
 
 // ── Alerts ───────────────────────────────────────────────────────────
 
+// alertFilterFromQuery reads the optional severity/machine_id/acknowledged
+// query params shared by the alert-listing endpoints.
+func alertFilterFromQuery(r *http.Request) AlertFilter {
+	f := AlertFilter{
+		MachineID: r.URL.Query().Get("machine_id"),
+		Severity:  AlertSeverity(r.URL.Query().Get("severity")),
+	}
+	if v := r.URL.Query().Get("acknowledged"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			f.Acknowledged = &b
+		}
+	}
+	return f
+}
+
 func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.Alerts())
+	writeJSON(w, http.StatusOK, s.store.Alerts(alertFilterFromQuery(r)))
 }
 
 func (s *Server) handleAcknowledgeAlert(w http.ResponseWriter, r *http.Request) {
@@ -106,7 +115,7 @@ func (s *Server) handleAcknowledgeAlert(w http.ResponseWriter, r *http.Request) 
 		uid = user.ID
 	}
 	s.store.AcknowledgeAlert(r.PathValue("id"), uid)
-	writeJSON(w, http.StatusOK, s.store.Alerts())
+	writeJSON(w, http.StatusOK, s.store.Alerts(AlertFilter{}))
 }
 
 func (s *Server) handleAcknowledgeAll(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +125,7 @@ func (s *Server) handleAcknowledgeAll(w http.ResponseWriter, r *http.Request) {
 		uid = user.ID
 	}
 	s.store.AcknowledgeAllAlerts(uid)
-	writeJSON(w, http.StatusOK, s.store.Alerts())
+	writeJSON(w, http.StatusOK, s.store.Alerts(AlertFilter{}))
 }
 
 // ── Thresholds ───────────────────────────────────────────────────────
@@ -142,7 +151,31 @@ func (s *Server) handleUpdateThreshold(w http.ResponseWriter, r *http.Request) {
 // ── Errors ───────────────────────────────────────────────────────────
 
 func (s *Server) handleErrors(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.ErrorLog())
+	q := r.URL.Query()
+	f := ErrorLogFilter{MachineID: q.Get("machine_id")}
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			f.Limit = n
+		}
+	}
+	if v := q.Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			f.Offset = n
+		}
+	}
+	if v := q.Get("from"); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			f.From = &t
+		}
+	}
+	if v := q.Get("to"); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			f.To = &t
+		}
+	}
+	entries, total := s.store.ErrorLog(f)
+	w.Header().Set("X-Total-Count", strconv.Itoa(total))
+	writeJSON(w, http.StatusOK, entries)
 }
 
 // ── Reports ──────────────────────────────────────────────────────────

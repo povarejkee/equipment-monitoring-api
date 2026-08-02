@@ -41,14 +41,16 @@ handler and returns `500` instead of crashing the process.
 | GET | `/api/machines/{id}/history?hours=` | ✓ | metric history |
 | GET | `/api/machines/{id}/downtimes` | ✓ | downtime log |
 | GET | `/api/machines/{id}/alerts` | ✓ | alerts for machine |
-| GET | `/api/alerts` | ✓ | all alerts |
+| GET | `/api/alerts?severity=&machine_id=&acknowledged=` | ✓ | alerts, filtered (all optional) |
 | POST | `/api/alerts/{id}/acknowledge` | ✓ | acknowledge one |
 | POST | `/api/alerts/acknowledge-all` | ✓ | acknowledge all |
 | GET | `/api/thresholds` | ✓ | alert thresholds |
 | PUT | `/api/thresholds` | ✓ | update a threshold |
-| GET | `/api/errors` | ✓ | error log (50 entries) |
+| GET | `/api/errors?limit=&offset=&machine_id=&from=&to=` | ✓ | error log, paginated/filtered (all optional; total match count in `X-Total-Count`) |
 | POST | `/api/reports` | ✓ | generate report |
 | GET | `/api/users` | ✓ | users |
+
+`from`/`to` on `/api/errors` are RFC3339 timestamps (e.g. `2026-07-01T00:00:00Z`).
 
 Demo accounts (password `demo`): `operator@demo.com`, `manager@demo.com`, `admin@demo.com`.
 
