@@ -1,94 +1,110 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 )
 
-// tokenTTL is how long a bearer token stays valid after login. Opaque
-// tokens with an in-memory TTL are a placeholder for the JWT/DB-session
-// rework (v3) — kept minimal since this whole scheme gets replaced then.
+// tokenTTL is how long a session stays valid after login.
 const tokenTTL = 24 * time.Hour
 
-// credential holds the demo password for a seeded user.
-// v2 keeps the same three demo accounts as v1 so the handoff build
-// behaves identically; real credential storage lands with the DB in v3.
-type credential struct {
-	password string
-	userID   string
-}
-
-type tokenEntry struct {
-	userID    string
-	expiresAt time.Time
-}
-
+// AuthManager handles credential verification and session lifecycle.
+// Sessions live in the DB (see internal/db/migrations/0002_auth.sql) so
+// they survive restarts and are shared if the API ever runs with more
+// than one instance; only a sha256 hash of the token is stored.
 type AuthManager struct {
-	mu     sync.RWMutex
-	creds  map[string]credential // email -> credential
-	tokens map[string]tokenEntry // token -> entry
-	store  *Store
+	pool *pgxpool.Pool
 }
 
-func NewAuthManager(store *Store) *AuthManager {
-	return &AuthManager{
-		creds: map[string]credential{
-			"operator@demo.com": {"demo", "u1"},
-			"manager@demo.com":  {"demo", "u2"},
-			"admin@demo.com":    {"demo", "u3"},
-		},
-		tokens: make(map[string]tokenEntry),
-		store:  store,
-	}
+func NewAuthManager(pool *pgxpool.Pool) *AuthManager {
+	return &AuthManager{pool: pool}
 }
 
+// Login verifies email/password against the stored bcrypt hash and, on
+// success, creates a new session and returns its token.
 func (a *AuthManager) Login(email, password string) (*User, string, bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	cred, ok := a.creds[strings.ToLower(strings.TrimSpace(email))]
-	if !ok || cred.password != password {
-		return nil, "", false
-	}
-	var user *User
-	for _, u := range a.store.Users() {
-		if u.ID == cred.userID {
-			user = u
-			break
+	ctx := context.Background()
+	email = strings.ToLower(strings.TrimSpace(email))
+
+	var u User
+	var passwordHash *string
+	row := a.pool.QueryRow(ctx,
+		`SELECT id, name, email, role, assigned_machines, password_hash FROM users WHERE email=$1`, email)
+	if err := row.Scan(&u.ID, &u.Name, &u.Email, &u.Role, &u.AssignedMachines, &passwordHash); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			logger.Error("login: query user", "error", err)
 		}
-	}
-	if user == nil {
 		return nil, "", false
 	}
+	if passwordHash == nil || bcrypt.CompareHashAndPassword([]byte(*passwordHash), []byte(password)) != nil {
+		return nil, "", false
+	}
+
+	token, err := a.createSession(ctx, u.ID)
+	if err != nil {
+		logger.Error("login: create session", "error", err, "userId", u.ID)
+		return nil, "", false
+	}
+	return &u, token, true
+}
+
+func (a *AuthManager) createSession(ctx context.Context, userID string) (string, error) {
 	token := newToken()
-	a.tokens[token] = tokenEntry{userID: user.ID, expiresAt: time.Now().Add(tokenTTL)}
-	return user, token, true
+	_, err := a.pool.Exec(ctx, `INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1,$2,$3)`,
+		hashToken(token), userID, time.Now().Add(tokenTTL))
+	if err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 // UserForToken resolves the user behind a bearer token, if any. Expired
-// tokens are treated as absent and evicted.
+// sessions are treated as absent and evicted.
 func (a *AuthManager) UserForToken(token string) *User {
-	a.mu.RLock()
-	entry, ok := a.tokens[token]
-	a.mu.RUnlock()
-	if !ok {
+	if token == "" {
 		return nil
 	}
-	if time.Now().After(entry.expiresAt) {
-		a.mu.Lock()
-		delete(a.tokens, token)
-		a.mu.Unlock()
-		return nil
-	}
-	for _, u := range a.store.Users() {
-		if u.ID == entry.userID {
-			return u
+	ctx := context.Background()
+	var u User
+	var expiresAt time.Time
+	row := a.pool.QueryRow(ctx, `SELECT u.id, u.name, u.email, u.role, u.assigned_machines, s.expires_at
+		FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash=$1`, hashToken(token))
+	if err := row.Scan(&u.ID, &u.Name, &u.Email, &u.Role, &u.AssignedMachines, &expiresAt); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			logger.Error("resolve session", "error", err)
 		}
+		return nil
 	}
-	return nil
+	if time.Now().After(expiresAt) {
+		a.Logout(token)
+		return nil
+	}
+	return &u
+}
+
+// Logout invalidates a session. Reports whether a session was found.
+func (a *AuthManager) Logout(token string) bool {
+	tag, err := a.pool.Exec(context.Background(), `DELETE FROM sessions WHERE token_hash=$1`, hashToken(token))
+	if err != nil {
+		logger.Error("logout", "error", err)
+		return false
+	}
+	return tag.RowsAffected() > 0
+}
+
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 func newToken() string {

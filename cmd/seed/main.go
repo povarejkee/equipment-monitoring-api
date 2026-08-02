@@ -25,7 +25,11 @@ import (
 	appdb "equipment-monitoring-api/internal/db"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/crypto/bcrypt"
 )
+
+// demoPassword is the login password for every seeded demo account.
+const demoPassword = "demo"
 
 func main() {
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -85,6 +89,12 @@ func main() {
 // ── users & thresholds ──────────────────────────────────────────────
 
 func seedUsers(ctx context.Context, tx pgx.Tx) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(demoPassword), bcrypt.DefaultCost)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hash demo password: %v\n", err)
+		os.Exit(1)
+	}
+
 	users := []struct{ id, name, email, role string }{
 		{"u1", "Иван Петров", "operator@demo.com", "operator"},
 		{"u2", "Мария Сидорова", "manager@demo.com", "manager"},
@@ -96,8 +106,8 @@ func seedUsers(ctx context.Context, tx pgx.Tx) {
 		if machines == nil {
 			machines = []string{}
 		}
-		mustExec(ctx, tx, `INSERT INTO users (id, name, email, role, assigned_machines) VALUES ($1,$2,$3,$4,$5)`,
-			u.id, u.name, u.email, u.role, machines)
+		mustExec(ctx, tx, `INSERT INTO users (id, name, email, role, assigned_machines, password_hash) VALUES ($1,$2,$3,$4,$5,$6)`,
+			u.id, u.name, u.email, u.role, machines, string(hash))
 	}
 }
 

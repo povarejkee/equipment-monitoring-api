@@ -2,9 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type Server struct {
@@ -51,6 +56,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, user)
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.auth.Logout(bearerToken(r))
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ── Machines ─────────────────────────────────────────────────────────
@@ -189,10 +199,132 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.GenerateReport(p))
 }
 
-// ── Users ────────────────────────────────────────────────────────────
+// ── Users (admin CRUD) ──────────────────────────────────────────────
 
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.Users())
+}
+
+func isValidRole(r UserRole) bool {
+	switch r {
+	case RoleOperator, RoleManager, RoleAdmin:
+		return true
+	default:
+		return false
+	}
+}
+
+type createUserRequest struct {
+	Name             string   `json:"name"`
+	Email            string   `json:"email"`
+	Password         string   `json:"password"`
+	Role             UserRole `json:"role"`
+	AssignedMachines []string `json:"assignedMachines,omitempty"`
+}
+
+func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	var req createUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Некорректный запрос")
+		return
+	}
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	if req.Name == "" || req.Email == "" || req.Password == "" || !isValidRole(req.Role) {
+		writeError(w, http.StatusBadRequest, "Обязательны name, email, password и корректная role")
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		logger.Error("hash password", "error", err)
+		writeError(w, http.StatusInternalServerError, "Внутренняя ошибка сервера")
+		return
+	}
+	u := User{
+		ID: newUserID(), Name: req.Name, Email: req.Email,
+		Role: req.Role, AssignedMachines: req.AssignedMachines,
+	}
+	created, err := s.store.CreateUser(u, string(hash))
+	if err != nil {
+		if isUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "Email уже используется")
+			return
+		}
+		logger.Error("create user", "error", err)
+		writeError(w, http.StatusInternalServerError, "Внутренняя ошибка сервера")
+		return
+	}
+	writeJSON(w, http.StatusCreated, created)
+}
+
+type updateUserRequest struct {
+	Name             *string   `json:"name,omitempty"`
+	Email            *string   `json:"email,omitempty"`
+	Password         *string   `json:"password,omitempty"`
+	Role             *UserRole `json:"role,omitempty"`
+	AssignedMachines *[]string `json:"assignedMachines,omitempty"`
+}
+
+func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req updateUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Некорректный запрос")
+		return
+	}
+	if req.Role != nil && !isValidRole(*req.Role) {
+		writeError(w, http.StatusBadRequest, "Некорректная роль")
+		return
+	}
+
+	update := UserUpdate{Name: req.Name, Role: req.Role, AssignedMachines: req.AssignedMachines}
+	if req.Email != nil {
+		trimmed := strings.ToLower(strings.TrimSpace(*req.Email))
+		update.Email = &trimmed
+	}
+	if req.Password != nil && *req.Password != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
+		if err != nil {
+			logger.Error("hash password", "error", err)
+			writeError(w, http.StatusInternalServerError, "Внутренняя ошибка сервера")
+			return
+		}
+		h := string(hash)
+		update.PasswordHash = &h
+	}
+
+	updated, err := s.store.UpdateUser(id, update)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Пользователь не найден")
+			return
+		}
+		if isUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "Email уже используется")
+			return
+		}
+		logger.Error("update user", "error", err, "id", id)
+		writeError(w, http.StatusInternalServerError, "Внутренняя ошибка сервера")
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if actor := userFromContext(r); actor != nil && actor.ID == id {
+		writeError(w, http.StatusBadRequest, "Нельзя удалить собственную учётную запись")
+		return
+	}
+	if err := s.store.DeleteUser(id); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Пользователь не найден")
+			return
+		}
+		logger.Error("delete user", "error", err, "id", id)
+		writeError(w, http.StatusInternalServerError, "Внутренняя ошибка сервера")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ── Health ───────────────────────────────────────────────────────────
@@ -204,10 +336,5 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // ── WebSocket ────────────────────────────────────────────────────────
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	// WS auth is best-effort: reject only if a token is present but invalid.
-	if tok := bearerToken(r); tok != "" && s.auth.UserForToken(tok) == nil {
-		writeError(w, http.StatusUnauthorized, "Не авторизован")
-		return
-	}
 	s.hub.HandleWS(w, r, s.store.Machines())
 }

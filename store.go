@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -411,6 +415,110 @@ func (s *Store) Users() []*User {
 		out = append(out, &u)
 	}
 	return out
+}
+
+// CreateUser inserts a new user with the given (already-hashed) password.
+// u.ID is expected to already be set (see newUserID).
+func (s *Store) CreateUser(u User, passwordHash string) (*User, error) {
+	if u.AssignedMachines == nil {
+		u.AssignedMachines = []string{}
+	}
+	_, err := s.pool.Exec(context.Background(),
+		`INSERT INTO users (id, name, email, role, assigned_machines, password_hash) VALUES ($1,$2,$3,$4,$5,$6)`,
+		u.ID, u.Name, u.Email, u.Role, u.AssignedMachines, passwordHash)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// UserUpdate is a partial patch for UpdateUser; nil fields are left
+// unchanged.
+type UserUpdate struct {
+	Name             *string
+	Email            *string
+	Role             *UserRole
+	AssignedMachines *[]string
+	PasswordHash     *string
+}
+
+// UpdateUser applies a partial patch and returns the updated user. Returns
+// pgx.ErrNoRows if id doesn't exist.
+func (s *Store) UpdateUser(id string, u UserUpdate) (*User, error) {
+	var set []string
+	var args []interface{}
+	add := func(col string, val interface{}) {
+		args = append(args, val)
+		set = append(set, fmt.Sprintf("%s=$%d", col, len(args)))
+	}
+	if u.Name != nil {
+		add("name", *u.Name)
+	}
+	if u.Email != nil {
+		add("email", *u.Email)
+	}
+	if u.Role != nil {
+		add("role", *u.Role)
+	}
+	if u.AssignedMachines != nil {
+		add("assigned_machines", *u.AssignedMachines)
+	}
+	if u.PasswordHash != nil {
+		add("password_hash", *u.PasswordHash)
+	}
+	if len(set) == 0 {
+		return s.userByID(id)
+	}
+
+	args = append(args, id)
+	query := fmt.Sprintf(
+		"UPDATE users SET %s WHERE id=$%d RETURNING id, name, email, role, assigned_machines",
+		strings.Join(set, ", "), len(args),
+	)
+	var out User
+	err := s.pool.QueryRow(context.Background(), query, args...).
+		Scan(&out.ID, &out.Name, &out.Email, &out.Role, &out.AssignedMachines)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *Store) userByID(id string) (*User, error) {
+	var u User
+	err := s.pool.QueryRow(context.Background(),
+		`SELECT id, name, email, role, assigned_machines FROM users WHERE id=$1`, id,
+	).Scan(&u.ID, &u.Name, &u.Email, &u.Role, &u.AssignedMachines)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// DeleteUser removes a user. Machines assigned to them are unassigned
+// (ON DELETE SET NULL) and their sessions are invalidated (ON DELETE
+// CASCADE) — see internal/db/migrations/0002_auth.sql. Returns
+// pgx.ErrNoRows if id doesn't exist.
+func (s *Store) DeleteUser(id string) error {
+	tag, err := s.pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+func newUserID() string {
+	b := make([]byte, 6)
+	_, _ = crand.Read(b)
+	return "u-" + hex.EncodeToString(b)
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 // ── Reports ──────────────────────────────────────────────────────────

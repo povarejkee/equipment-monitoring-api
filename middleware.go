@@ -75,3 +75,16 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		next.ServeHTTP(w, r.WithContext(ctx))
 	}
 }
+
+// requireRole restricts access to a single role. Must run after
+// authMiddleware, which puts the user in context.
+func requireRole(role UserRole, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := userFromContext(r)
+		if user == nil || user.Role != role {
+			writeError(w, http.StatusForbidden, "Недостаточно прав")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
+}

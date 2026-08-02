@@ -8,8 +8,9 @@ import (
 
 func newTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
-	store := NewStore(requireTestDB(t))
-	auth := NewAuthManager(store)
+	pool := requireTestDB(t)
+	store := NewStore(pool)
+	auth := NewAuthManager(pool)
 	srv := NewServer(store, auth, NewHub())
 	_, token, _ := auth.Login("admin@demo.com", "demo")
 	return srv, token

@@ -31,7 +31,7 @@ func main() {
 	}
 
 	store := NewStore(pool)
-	auth := NewAuthManager(store)
+	auth := NewAuthManager(pool)
 	hub := NewHub()
 	srv := NewServer(store, auth, hub)
 	loginLimiter := newIPRateLimiter(5, time.Minute)
@@ -50,10 +50,11 @@ func main() {
 	// Public
 	mux.HandleFunc("POST /api/auth/login", rateLimitMiddleware(loginLimiter, srv.handleLogin))
 	mux.HandleFunc("GET /api/health", srv.handleHealth)
-	mux.HandleFunc("GET /ws", srv.handleWS)
 
 	// Protected
+	mux.HandleFunc("GET /ws", srv.authMiddleware(srv.handleWS))
 	mux.HandleFunc("GET /api/auth/me", srv.authMiddleware(srv.handleMe))
+	mux.HandleFunc("POST /api/auth/logout", srv.authMiddleware(srv.handleLogout))
 	mux.HandleFunc("GET /api/machines", srv.authMiddleware(srv.handleMachines))
 	mux.HandleFunc("GET /api/machines/{id}", srv.authMiddleware(srv.handleMachine))
 	mux.HandleFunc("GET /api/machines/{id}/history", srv.authMiddleware(srv.handleMachineHistory))
@@ -67,6 +68,9 @@ func main() {
 	mux.HandleFunc("GET /api/errors", srv.authMiddleware(srv.handleErrors))
 	mux.HandleFunc("POST /api/reports", srv.authMiddleware(srv.handleReport))
 	mux.HandleFunc("GET /api/users", srv.authMiddleware(srv.handleUsers))
+	mux.HandleFunc("POST /api/users", srv.authMiddleware(requireRole(RoleAdmin, srv.handleCreateUser)))
+	mux.HandleFunc("PUT /api/users/{id}", srv.authMiddleware(requireRole(RoleAdmin, srv.handleUpdateUser)))
+	mux.HandleFunc("DELETE /api/users/{id}", srv.authMiddleware(requireRole(RoleAdmin, srv.handleDeleteUser)))
 
 	var allowed []string
 	if raw := os.Getenv("ALLOWED_ORIGINS"); raw != "" {

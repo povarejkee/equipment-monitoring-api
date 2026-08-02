@@ -48,8 +48,19 @@ Env vars:
   placeholders, not aggregated from `metric_history`/`downtimes` yet — real
   aggregation is a separate change.
 
-## Security
+## Auth
 
+- Passwords are bcrypt-hashed and stored in `users.password_hash` — no
+  hardcoded credentials in code anymore.
+- Sessions live in the `sessions` table (`token_hash` = sha256 of the
+  bearer token, `expires_at`, 24h TTL from login). `UserForToken` evicts
+  expired sessions on lookup. `POST /api/auth/logout` deletes the session.
+- `GET /ws` requires the same bearer token as everything else (via
+  `authMiddleware`) — previously a missing token skipped the check
+  entirely instead of rejecting.
+- User CRUD (`POST`/`PUT`/`DELETE /api/users`) is admin-only
+  (`requireRole`); deleting a user unassigns their machines and cascades
+  their sessions. Self-delete is blocked.
 - `POST /api/auth/login` is rate-limited to 5 attempts/minute per IP
   (sliding window, in-memory). Over the limit → `429`.
 
@@ -60,19 +71,15 @@ go test ./... -cover                                    # DB-dependent tests ski
 TEST_DATABASE_URL=$DATABASE_URL go test ./... -cover    # runs everything
 ```
 
-Covers `auth.go` (login, unknown/wrong password, token resolution, token
-expiry), `store.go`'s `updateStatus` (status transitions from
-temperature/load/vibration), and `middleware.go` (`authMiddleware`,
-`corsMiddleware`). Auth/middleware tests now go through a real `Store`
-(since `Login` resolves users via the DB), so they need `TEST_DATABASE_URL`
-and skip cleanly without it — `TestMain` truncates and reseeds the `users`
-table before each such test for isolation. Key-logic coverage is 90-100% on
-these units; whole-package coverage is lower since handlers/hub/seeding
-aren't unit-tested.
-
-Bearer tokens now carry a 24h TTL (in-memory) instead of never expiring —
-minimal groundwork so expiry is testable; full JWT/DB-session auth is a
-separate, larger change.
+Covers `auth.go` (login, unknown/wrong password, session resolution,
+session expiry, logout), `store.go`'s `updateStatus` (status transitions
+from temperature/load/vibration), and `middleware.go` (`authMiddleware`,
+`corsMiddleware`). Auth/middleware tests go through a real DB (`Login`
+resolves users and sessions there), so they need `TEST_DATABASE_URL` and
+skip cleanly without it — `TestMain` truncates and reseeds `users` (with a
+bcrypt hash of the demo password) before each such test for isolation.
+Key-logic coverage is 90-100% on these units; whole-package coverage is
+lower since handlers/hub/seeding aren't unit-tested.
 
 ## Logging
 
@@ -85,9 +92,11 @@ handler and returns `500` instead of crashing the process.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| POST | `/api/auth/login` | — | `{email,password}` → `{token,user}` |
+| POST | `/api/auth/login` | — | `{email,password}` → `{token,user}`; 5/min/IP |
 | GET | `/api/health` | — | health check |
-| GET | `/ws?token=<t>` | opt | WebSocket, pushes `{topic:"machines",payload}` |
+| GET | `/ws?token=<t>` | ✓ | WebSocket, pushes `{topic:"machines",payload}` |
+| GET | `/api/auth/me` | ✓ | current user |
+| POST | `/api/auth/logout` | ✓ | invalidate the current session |
 | GET | `/api/machines` | ✓ | all machines |
 | GET | `/api/machines/{id}` | ✓ | one machine |
 | GET | `/api/machines/{id}/history?hours=` | ✓ | metric history |
@@ -101,6 +110,9 @@ handler and returns `500` instead of crashing the process.
 | GET | `/api/errors?limit=&offset=&machine_id=&from=&to=` | ✓ | error log, paginated/filtered (all optional; total match count in `X-Total-Count`) |
 | POST | `/api/reports` | ✓ | generate report |
 | GET | `/api/users` | ✓ | users |
+| POST | `/api/users` | admin | create user `{name,email,password,role,assignedMachines?}` |
+| PUT | `/api/users/{id}` | admin | partial update (any subset of the create fields) |
+| DELETE | `/api/users/{id}` | admin | delete user (can't delete self) |
 
 `from`/`to` on `/api/errors` are RFC3339 timestamps (e.g. `2026-07-01T00:00:00Z`).
 

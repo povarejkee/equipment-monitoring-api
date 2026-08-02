@@ -7,6 +7,7 @@ import (
 
 	appdb "equipment-monitoring-api/internal/db"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // testPool is shared across the package's tests when TEST_DATABASE_URL is
@@ -42,7 +43,7 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	}
 	ctx := context.Background()
 	if _, err := testPool.Exec(ctx,
-		`TRUNCATE users, machines, alerts, error_log, metric_history, downtimes, thresholds RESTART IDENTITY CASCADE`,
+		`TRUNCATE users, machines, alerts, error_log, metric_history, downtimes, thresholds, sessions RESTART IDENTITY CASCADE`,
 	); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
@@ -50,17 +51,25 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	return testPool
 }
 
+// testUserPassword is the plaintext password behind every seeded test user
+// (matches the "demo" convention used by the real seed script).
+const testUserPassword = "demo"
+
 func seedTestUsers(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
+	hash, err := bcrypt.GenerateFromPassword([]byte(testUserPassword), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hash test password: %v", err)
+	}
 	users := []struct{ id, name, email, role string }{
 		{"u1", "Иван Петров", "operator@demo.com", "operator"},
 		{"u2", "Мария Сидорова", "manager@demo.com", "manager"},
 		{"u3", "Алексей Иванов", "admin@demo.com", "admin"},
 	}
 	for _, u := range users {
-		if _, err := pool.Exec(ctx, `INSERT INTO users (id, name, email, role) VALUES ($1,$2,$3,$4)`,
-			u.id, u.name, u.email, u.role); err != nil {
+		if _, err := pool.Exec(ctx, `INSERT INTO users (id, name, email, role, password_hash) VALUES ($1,$2,$3,$4,$5)`,
+			u.id, u.name, u.email, u.role, string(hash)); err != nil {
 			t.Fatalf("seed user %s: %v", u.id, err)
 		}
 	}
