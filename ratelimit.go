@@ -19,10 +19,44 @@ type ipRateLimiter struct {
 }
 
 func newIPRateLimiter(limit int, window time.Duration) *ipRateLimiter {
-	return &ipRateLimiter{
+	l := &ipRateLimiter{
 		limit:  limit,
 		window: window,
 		hits:   make(map[string][]time.Time),
+	}
+	go l.sweepLoop()
+	return l
+}
+
+// sweepLoop periodically drops IPs with no hits left inside the window.
+// Without this, the map only ever grows: every distinct IP that has ever
+// made a request (real or, before the X-Forwarded-For fix below, freely
+// spoofed) leaves a permanent entry behind even after its hits have aged
+// out — a slow unbounded memory leak on a public endpoint.
+func (l *ipRateLimiter) sweepLoop() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		l.sweep()
+	}
+}
+
+func (l *ipRateLimiter) sweep() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cutoff := time.Now().Add(-l.window)
+	for ip, hits := range l.hits {
+		live := hits[:0]
+		for _, t := range hits {
+			if t.After(cutoff) {
+				live = append(live, t)
+			}
+		}
+		if len(live) == 0 {
+			delete(l.hits, ip)
+		} else {
+			l.hits[ip] = live
+		}
 	}
 }
 
@@ -58,11 +92,20 @@ func rateLimitMiddleware(l *ipRateLimiter, next http.HandlerFunc) http.HandlerFu
 	}
 }
 
-// clientIP extracts the caller's address, preferring X-Forwarded-For (set by
-// Render's proxy in front of the service) over the raw connection address.
+// clientIP extracts the caller's real address for rate-limiting purposes.
+//
+// X-Forwarded-For is a comma-separated list that grows by one entry per
+// proxy hop, each hop appending the address it saw the request come from.
+// The FIRST entry is whatever the original client put there — completely
+// attacker-controlled, since nothing stops a client from sending
+// `X-Forwarded-For: 1.2.3.4` (or a fresh random value on every request) and
+// getting a brand new rate-limit bucket each time. The trustworthy value is
+// the LAST entry: the address Render's own edge proxy (the only hop in
+// front of this service) observed directly, which the client cannot forge.
 func clientIP(r *http.Request) string {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		if ip := strings.TrimSpace(strings.Split(fwd, ",")[0]); ip != "" {
+		parts := strings.Split(fwd, ",")
+		if ip := strings.TrimSpace(parts[len(parts)-1]); ip != "" {
 			return ip
 		}
 	}
