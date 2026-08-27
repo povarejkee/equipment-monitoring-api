@@ -54,15 +54,38 @@ Env vars:
   hardcoded credentials in code anymore.
 - Sessions live in the `sessions` table (`token_hash` = sha256 of the
   bearer token, `expires_at`, 24h TTL from login). `UserForToken` evicts
-  expired sessions on lookup. `POST /api/auth/logout` deletes the session.
+  expired sessions on lookup; a periodic sweep (see Maintenance) catches
+  ones nobody ever looks up again. `POST /api/auth/logout` deletes the
+  session.
+- A DB failure while resolving a session is a `502`, never a `401` —
+  `authMiddleware` distinguishes "no such session" from "couldn't check."
+  Conflating the two would mean a transient DB blip signs every active
+  user out (the frontend treats `401` as "log this user out").
 - `GET /ws` requires the same bearer token as everything else (via
   `authMiddleware`) — previously a missing token skipped the check
   entirely instead of rejecting.
 - User CRUD (`POST`/`PUT`/`DELETE /api/users`) is admin-only
   (`requireRole`); deleting a user unassigns their machines and cascades
-  their sessions. Self-delete is blocked.
-- `POST /api/auth/login` is rate-limited to 5 attempts/minute per IP
-  (sliding window, in-memory). Over the limit → `429`.
+  their sessions. Self-delete is blocked. Listing users
+  (`GET /api/users`) is manager/admin (`requireRoles`) — operators don't
+  get the full user list.
+- `POST /api/auth/login` is rate-limited to 5 attempts/minute per real
+  client IP (sliding window, in-memory) — see `clientIP` in `ratelimit.go`
+  for why it trusts the *last* `X-Forwarded-For` entry, not the first.
+  Over the limit → `429`.
+
+## Access control
+
+Enforced server-side, not just filtered in the frontend: an operator only
+sees machines in their `assignedMachines` (and, transitively, alerts/
+errors for those machines) — `GET /api/machines`, `.../history`,
+`.../downtimes`, `.../alerts`, `GET /api/alerts`, and `GET /api/errors`
+all apply this. An operator with an empty `assignedMachines` sees
+nothing (fails closed). Manager and admin see everything. See
+`canAccessMachine`/`scopedMachines` in `middleware.go`.
+
+Not scoped: acknowledging an alert doesn't check whether the caller can
+see that alert's machine.
 
 ## Tests
 
@@ -72,14 +95,79 @@ TEST_DATABASE_URL=$DATABASE_URL go test ./... -cover    # runs everything
 ```
 
 Covers `auth.go` (login, unknown/wrong password, session resolution,
-session expiry, logout), `store.go`'s `updateStatus` (status transitions
-from temperature/load/vibration), and `middleware.go` (`authMiddleware`,
-`corsMiddleware`). Auth/middleware tests go through a real DB (`Login`
-resolves users and sessions there), so they need `TEST_DATABASE_URL` and
-skip cleanly without it — `TestMain` truncates and reseeds `users` (with a
-bcrypt hash of the demo password) before each such test for isolation.
-Key-logic coverage is 90-100% on these units; whole-package coverage is
-lower since handlers/hub/seeding aren't unit-tested.
+session expiry, logout, DB-failure-vs-unauthorized), `store.go`'s
+`updateStatus` and the alert engine (crossing opens an alert, repeated
+ticks don't duplicate it, re-alerts after acknowledge, nothing fires in
+range), `middleware.go` (`authMiddleware`, `corsMiddleware`,
+`canAccessMachine`/`scopedMachines`), `hub.go` (concurrent
+connect+broadcast under `-race`, a slow client doesn't stall delivery,
+cleanup is idempotent), and `ratelimit.go` (limit enforcement, the sweep,
+and specifically that a spoofed first `X-Forwarded-For` hop can't reset
+the bucket). Auth/middleware/alert tests go through a real DB, so they
+need `TEST_DATABASE_URL` and skip cleanly without it — `TestMain`
+truncates and reseeds `users` (with a bcrypt hash of the demo password)
+before each such test for isolation. Key-logic coverage is 90-100% on
+these units; whole-package coverage is lower since handlers/seeding
+aren't unit-tested.
+
+A few of these regressions were verified by temporarily reverting the fix
+and confirming the new test actually fails against the old code (the WS
+crash and the X-Forwarded-For spoof, specifically) — not just that it
+passes against the fix.
+
+## WebSocket
+
+Each client gets its own buffered send channel and a dedicated write-pump
+goroutine — it's the only goroutine that writes to that connection.
+Earlier, the HTTP handler wrote the initial snapshot directly while the
+broadcast loop could write concurrently from a different goroutine;
+gorilla/websocket allows only one writer and panics on a second,
+which crashed the whole process (not just the request). Also: ping/pong
+with a read deadline (dead connections used to linger forever), and a
+client that falls more than 16 messages behind is dropped instead of
+stalling delivery to everyone else.
+
+## Alerts
+
+Generated in real time by `Tick()` (`checkThresholdAlerts` in
+`store.go`), not just at seed time — previously nothing ever inserted
+into `alerts` after startup, so the list was frozen at whatever the seed
+wrote. Each tick compares temperature/load/vibration against the
+*current* `thresholds` row (read fresh, not cached, so a `PUT
+/api/thresholds` takes effect on the next tick) and opens an alert when a
+machine crosses into warning/critical. Hysteresis: a machine+metric with
+an already-open (unacknowledged) alert doesn't get a duplicate every 4s;
+acknowledging it lets a still-out-of-range value alert again next tick.
+`machine_down`/`machine_offline`/`maintenance_due`/`anomaly_detected`
+remain seed-only — those need a different signal than a threshold
+crossing.
+
+## Maintenance
+
+A daily background loop (`main.go`) runs two cleanup jobs (also once at
+startup, not after a full day's wait):
+- `Store.PruneMetricHistory` — deletes rows older than 35 days.
+  `Tick()` inserts one row per active machine every 4s with no
+  retention otherwise, which is ~500MB/month — Render's free Postgres
+  plan is capped at 1GB.
+- `AuthManager.PruneExpiredSessions` — deletes sessions past `expires_at`
+  that nobody looked up again to trigger the on-read eviction.
+
+## Reliability
+
+- Every `Store` method that reads/writes the DB returns an error instead
+  of logging-and-returning-nil; handlers map that to `502` via
+  `writeDBError`. Previously a DB hiccup made list endpoints return
+  `null` with `200` — indistinguishable from "no data" for a monitoring
+  product.
+- `Tick()`'s broadcast is skipped (not sent as an empty payload) if the
+  tick itself failed, so a DB blip can't overwrite every connected
+  client's good data with nothing.
+- Graceful shutdown: SIGTERM/SIGINT stop new ticks/maintenance and drain
+  in-flight HTTP requests (15s) before the process exits with code 0.
+  Previously there was no signal handling at all — every deploy or
+  restart was a hard kill that could cut off a request or a `Tick()`
+  transaction mid-write.
 
 ## Reports
 
@@ -112,19 +200,19 @@ handler and returns `500` instead of crashing the process.
 | GET | `/ws?token=<t>` | ✓ | WebSocket, pushes `{topic:"machines",payload}` |
 | GET | `/api/auth/me` | ✓ | current user |
 | POST | `/api/auth/logout` | ✓ | invalidate the current session |
-| GET | `/api/machines` | ✓ | all machines |
-| GET | `/api/machines/{id}` | ✓ | one machine |
-| GET | `/api/machines/{id}/history?hours=` | ✓ | metric history |
-| GET | `/api/machines/{id}/downtimes` | ✓ | downtime log |
-| GET | `/api/machines/{id}/alerts` | ✓ | alerts for machine |
-| GET | `/api/alerts?severity=&machine_id=&acknowledged=` | ✓ | alerts, filtered (all optional) |
+| GET | `/api/machines` | ✓ scoped | machines (operator: only their assigned ones) |
+| GET | `/api/machines/{id}` | ✓ scoped | one machine (403 if not assigned to caller) |
+| GET | `/api/machines/{id}/history?hours=` | ✓ scoped | metric history |
+| GET | `/api/machines/{id}/downtimes` | ✓ scoped | downtime log |
+| GET | `/api/machines/{id}/alerts` | ✓ scoped | alerts for machine |
+| GET | `/api/alerts?severity=&machine_id=&acknowledged=` | ✓ scoped | alerts, filtered (all optional) |
 | POST | `/api/alerts/{id}/acknowledge` | ✓ | acknowledge one |
 | POST | `/api/alerts/acknowledge-all` | ✓ | acknowledge all |
 | GET | `/api/thresholds` | ✓ | alert thresholds |
-| PUT | `/api/thresholds` | ✓ | update a threshold |
-| GET | `/api/errors?limit=&offset=&machine_id=&from=&to=` | ✓ | error log, paginated/filtered (all optional; total match count in `X-Total-Count`) |
+| PUT | `/api/thresholds` | ✓ | update a threshold (rejects warning > critical) |
+| GET | `/api/errors?limit=&offset=&machine_id=&from=&to=` | ✓ scoped | error log, paginated/filtered (all optional; total match count in `X-Total-Count`) |
 | POST | `/api/reports` | ✓ | generate report |
-| GET | `/api/users` | ✓ | users |
+| GET | `/api/users` | manager/admin | users |
 | POST | `/api/users` | admin | create user `{name,email,password,role,assignedMachines?}` |
 | PUT | `/api/users/{id}` | admin | partial update (any subset of the create fields) |
 | DELETE | `/api/users/{id}` | admin | delete user (can't delete self) |
