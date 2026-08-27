@@ -110,6 +110,14 @@ func (s *Store) Tick() ([]*Machine, error) {
 		return machines, nil
 	}
 
+	// Read fresh each tick (not cached) so an admin's PUT /api/thresholds
+	// takes effect on the next tick, not after a restart.
+	thresholds, err := s.Thresholds()
+	if err != nil {
+		logger.Error("tick: query thresholds", "error", err)
+		thresholds = nil // degrade to no threshold alerting rather than failing the whole tick
+	}
+
 	s.rngMu.Lock()
 	defer s.rngMu.Unlock()
 
@@ -160,6 +168,8 @@ func (s *Store) Tick() ([]*Machine, error) {
 		); err != nil {
 			logger.Error("tick: insert history", "error", err, "id", m.ID)
 		}
+
+		s.checkThresholdAlerts(ctx, tx, m, thresholds)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -185,6 +195,97 @@ func (s *Store) updateStatus(m *Machine) {
 	default:
 		m.Status = StatusRunning
 	}
+}
+
+// checkThresholdAlerts compares m's freshly-ticked metrics against the
+// current alert thresholds and opens a new alert for any metric that has
+// crossed into warning/critical territory — this is the only source of
+// alerts besides the initial seed. Previously nothing created alerts at
+// runtime at all: the alerts list was frozen at whatever the seed script
+// wrote, so a station could overheat for hours and the UI would never
+// show a new alert.
+//
+// Hysteresis: a metric only generates a new alert if it doesn't already
+// have an open (unacknowledged) alert for that machine+metric. Once
+// acknowledged, a still-out-of-range metric will alert again on the next
+// tick — that's intentional (re-alert after ack if the problem persists),
+// not spam from a value oscillating around the boundary.
+//
+// Scope: only the three metrics with real thresholds (temperature, load,
+// vibration) are covered. machine_down/machine_offline/maintenance_due/
+// anomaly_detected remain seed-only for now — those need a different
+// signal (connectivity loss, scheduled maintenance, statistical outlier
+// detection) than a simple threshold crossing.
+func (s *Store) checkThresholdAlerts(ctx context.Context, tx pgx.Tx, m *Machine, thresholds []*AlertThreshold) {
+	for _, th := range thresholds {
+		value, ok := thresholdMetricValue(m, th.Metric)
+		if !ok {
+			continue
+		}
+
+		var severity AlertSeverity
+		var thresholdValue float64
+		switch {
+		case value >= th.CriticalValue:
+			severity, thresholdValue = SeverityCritical, th.CriticalValue
+		case value >= th.WarningValue:
+			severity, thresholdValue = SeverityWarning, th.WarningValue
+		default:
+			continue // within normal range
+		}
+
+		var alreadyOpen bool
+		err := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM alerts WHERE machine_id=$1 AND metric_name=$2 AND acknowledged=false)`,
+			m.ID, th.Metric,
+		).Scan(&alreadyOpen)
+		if err != nil {
+			logger.Error("tick: check open alert", "error", err, "machineId", m.ID, "metric", th.Metric)
+			continue
+		}
+		if alreadyOpen {
+			continue
+		}
+
+		message := fmt.Sprintf("%s: %s превысила %s порог (%.1f %s)",
+			m.Name, th.Label, severityRuLabel(severity), value, th.Unit)
+		_, err = tx.Exec(ctx, `INSERT INTO alerts
+			(id, machine_id, machine_name, type, severity, message, metric_name, current_value, threshold_value, timestamp, acknowledged)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false)`,
+			newAlertID(), m.ID, m.Name, AlertThresholdExceeded, severity, message, th.Metric, value, thresholdValue, time.Now())
+		if err != nil {
+			logger.Error("tick: insert alert", "error", err, "machineId", m.ID, "metric", th.Metric)
+		}
+	}
+}
+
+func thresholdMetricValue(m *Machine, metric string) (float64, bool) {
+	switch metric {
+	case "temperature":
+		return m.Metrics.Temperature, true
+	case "load":
+		return m.Metrics.Load, true
+	case "vibration":
+		if m.Metrics.Vibration == nil {
+			return 0, false
+		}
+		return *m.Metrics.Vibration, true
+	default:
+		return 0, false
+	}
+}
+
+func severityRuLabel(sev AlertSeverity) string {
+	if sev == SeverityCritical {
+		return "критический"
+	}
+	return "предупредительный"
+}
+
+func newAlertID() string {
+	b := make([]byte, 6)
+	_, _ = crand.Read(b)
+	return "alert-" + hex.EncodeToString(b)
 }
 
 // ── History ──────────────────────────────────────────────────────────
