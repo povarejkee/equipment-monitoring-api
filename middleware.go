@@ -84,12 +84,60 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // requireRole restricts access to a single role. Must run after
 // authMiddleware, which puts the user in context.
 func requireRole(role UserRole, next http.HandlerFunc) http.HandlerFunc {
+	return requireRoles([]UserRole{role}, next)
+}
+
+// requireRoles restricts access to any of the given roles.
+func requireRoles(roles []UserRole, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := userFromContext(r)
-		if user == nil || user.Role != role {
+		if user == nil {
 			writeError(w, http.StatusForbidden, "Недостаточно прав")
 			return
 		}
-		next.ServeHTTP(w, r)
+		for _, role := range roles {
+			if user.Role == role {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		writeError(w, http.StatusForbidden, "Недостаточно прав")
 	}
+}
+
+// canAccessMachine implements the access rule from the spec: "оператор
+// видит свой станок, руководитель — всё". Only operators are scoped; any
+// other role (manager, admin) sees everything. An operator with an empty
+// AssignedMachines list sees nothing — fail closed, not open. This mirrors
+// (and actually enforces, server-side) AuthService.canAccessMachine on the
+// frontend, which existed but was never wired into a guard and had no
+// effect since the frontend fetched the unfiltered list anyway.
+func canAccessMachine(user *User, machineID string) bool {
+	if user == nil {
+		return false
+	}
+	if user.Role != RoleOperator {
+		return true
+	}
+	for _, id := range user.AssignedMachines {
+		if id == machineID {
+			return true
+		}
+	}
+	return false
+}
+
+// scopedMachines filters a machine list down to what the caller is allowed
+// to see (see canAccessMachine).
+func scopedMachines(user *User, machines []*Machine) []*Machine {
+	if user == nil || user.Role != RoleOperator {
+		return machines
+	}
+	out := make([]*Machine, 0, len(machines))
+	for _, m := range machines {
+		if canAccessMachine(user, m.ID) {
+			out = append(out, m)
+		}
+	}
+	return out
 }

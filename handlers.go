@@ -77,17 +77,31 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 // ── Machines ─────────────────────────────────────────────────────────
 
+// writeForbiddenMachine writes the standard "not your machine" response for
+// an operator whose AssignedMachines doesn't include the requested id.
+func writeForbiddenMachine(w http.ResponseWriter) {
+	writeError(w, http.StatusForbidden, "Нет доступа к этому станку")
+}
+
 func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request) {
 	machines, err := s.store.Machines()
 	if err != nil {
 		writeDBError(w, "list machines", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, machines)
+	// "оператор видит свой станок, руководитель — всё" (per spec) — scoped
+	// server-side; the equivalent frontend-only filter was cosmetic, since
+	// the unfiltered list was already in the browser either way.
+	writeJSON(w, http.StatusOK, scopedMachines(userFromContext(r), machines))
 }
 
 func (s *Server) handleMachine(w http.ResponseWriter, r *http.Request) {
-	m, err := s.store.Machine(r.PathValue("id"))
+	id := r.PathValue("id")
+	if !canAccessMachine(userFromContext(r), id) {
+		writeForbiddenMachine(w)
+		return
+	}
+	m, err := s.store.Machine(id)
 	if err != nil {
 		writeDBError(w, "get machine", err)
 		return
@@ -100,13 +114,18 @@ func (s *Server) handleMachine(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMachineHistory(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !canAccessMachine(userFromContext(r), id) {
+		writeForbiddenMachine(w)
+		return
+	}
 	hours := 24
 	if h := r.URL.Query().Get("hours"); h != "" {
 		if parsed, err := strconv.Atoi(h); err == nil && parsed > 0 {
 			hours = parsed
 		}
 	}
-	history, err := s.store.History(r.PathValue("id"), hours)
+	history, err := s.store.History(id, hours)
 	if err != nil {
 		writeDBError(w, "get machine history", err)
 		return
@@ -115,7 +134,12 @@ func (s *Server) handleMachineHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMachineDowntimes(w http.ResponseWriter, r *http.Request) {
-	downtimes, err := s.store.Downtimes(r.PathValue("id"))
+	id := r.PathValue("id")
+	if !canAccessMachine(userFromContext(r), id) {
+		writeForbiddenMachine(w)
+		return
+	}
+	downtimes, err := s.store.Downtimes(id)
 	if err != nil {
 		writeDBError(w, "get machine downtimes", err)
 		return
@@ -124,7 +148,12 @@ func (s *Server) handleMachineDowntimes(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleMachineAlerts(w http.ResponseWriter, r *http.Request) {
-	alerts, err := s.store.Alerts(AlertFilter{MachineID: r.PathValue("id")})
+	id := r.PathValue("id")
+	if !canAccessMachine(userFromContext(r), id) {
+		writeForbiddenMachine(w)
+		return
+	}
+	alerts, err := s.store.Alerts(AlertFilter{MachineID: id})
 	if err != nil {
 		writeDBError(w, "get machine alerts", err)
 		return
@@ -155,7 +184,14 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 		writeDBError(w, "list alerts", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, alerts)
+	user := userFromContext(r)
+	out := make([]*Alert, 0, len(alerts))
+	for _, a := range alerts {
+		if canAccessMachine(user, a.MachineID) {
+			out = append(out, a)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleAcknowledgeAlert(w http.ResponseWriter, r *http.Request) {
@@ -244,6 +280,12 @@ func (s *Server) handleUpdateThreshold(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleErrors(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := ErrorLogFilter{MachineID: q.Get("machine_id")}
+	if user := userFromContext(r); user != nil && user.Role == RoleOperator {
+		// Fail closed: an operator with no assigned machines gets an
+		// explicit empty (non-nil) slice, which matches zero rows —
+		// never "no restriction" by accident.
+		f.MachineIDs = append([]string{}, user.AssignedMachines...)
+	}
 	if v := q.Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			f.Limit = n

@@ -477,9 +477,14 @@ func (s *Store) UpdateThreshold(metric string, warning, critical float64) error 
 // on this field" (Limit == 0 returns everything after From/To/MachineID).
 type ErrorLogFilter struct {
 	MachineID string
-	From, To  *time.Time
-	Limit     int
-	Offset    int
+	// MachineIDs, if non-empty, restricts results to this set regardless
+	// of MachineID — the server-enforced access scope for an operator
+	// (see canAccessMachine), as opposed to MachineID which is the
+	// caller's own optional query filter. Both apply together.
+	MachineIDs []string
+	From, To   *time.Time
+	Limit      int
+	Offset     int
 }
 
 // ErrorLog returns entries matching f (newest-first) plus the total match
@@ -493,6 +498,10 @@ func (s *Store) ErrorLog(f ErrorLogFilter) ([]*ErrorLogEntry, int, error) {
 	if f.MachineID != "" {
 		args = append(args, f.MachineID)
 		query += fmt.Sprintf(" AND machine_id=$%d", len(args))
+	}
+	if f.MachineIDs != nil {
+		args = append(args, f.MachineIDs)
+		query += fmt.Sprintf(" AND machine_id = ANY($%d)", len(args))
 	}
 	if f.From != nil {
 		args = append(args, *f.From)

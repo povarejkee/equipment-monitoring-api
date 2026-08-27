@@ -127,7 +127,7 @@ func main() {
 	mux.HandleFunc("PUT /api/thresholds", srv.authMiddleware(srv.handleUpdateThreshold))
 	mux.HandleFunc("GET /api/errors", srv.authMiddleware(srv.handleErrors))
 	mux.HandleFunc("POST /api/reports", srv.authMiddleware(srv.handleReport))
-	mux.HandleFunc("GET /api/users", srv.authMiddleware(srv.handleUsers))
+	mux.HandleFunc("GET /api/users", srv.authMiddleware(requireRoles([]UserRole{RoleManager, RoleAdmin}, srv.handleUsers)))
 	mux.HandleFunc("POST /api/users", srv.authMiddleware(requireRole(RoleAdmin, srv.handleCreateUser)))
 	mux.HandleFunc("PUT /api/users/{id}", srv.authMiddleware(requireRole(RoleAdmin, srv.handleUpdateUser)))
 	mux.HandleFunc("DELETE /api/users/{id}", srv.authMiddleware(requireRole(RoleAdmin, srv.handleDeleteUser)))

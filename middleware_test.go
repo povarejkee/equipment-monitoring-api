@@ -133,3 +133,59 @@ func TestCorsMiddleware_AllowlistRejectsUnknownOrigin(t *testing.T) {
 		t.Errorf("Access-Control-Allow-Origin = %q, want empty for disallowed origin", got)
 	}
 }
+
+func TestCanAccessMachine(t *testing.T) {
+	operator := &User{Role: RoleOperator, AssignedMachines: []string{"m1", "m2"}}
+	operatorNoMachines := &User{Role: RoleOperator, AssignedMachines: nil}
+	manager := &User{Role: RoleManager}
+	admin := &User{Role: RoleAdmin}
+
+	cases := []struct {
+		name string
+		user *User
+		id   string
+		want bool
+	}{
+		{"operator sees an assigned machine", operator, "m1", true},
+		{"operator does not see an unassigned machine", operator, "m5", false},
+		{"operator with no assignments sees nothing (fail closed)", operatorNoMachines, "m1", false},
+		{"manager sees everything", manager, "m99", true},
+		{"admin sees everything", admin, "m99", true},
+		{"nil user sees nothing", nil, "m1", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := canAccessMachine(c.user, c.id); got != c.want {
+				t.Errorf("canAccessMachine() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestScopedMachines(t *testing.T) {
+	all := []*Machine{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}
+
+	t.Run("operator sees only assigned machines", func(t *testing.T) {
+		operator := &User{Role: RoleOperator, AssignedMachines: []string{"m1", "m3"}}
+		got := scopedMachines(operator, all)
+		if len(got) != 2 || got[0].ID != "m1" || got[1].ID != "m3" {
+			t.Errorf("scopedMachines() = %v, want [m1 m3]", got)
+		}
+	})
+
+	t.Run("operator with no assignments sees nothing", func(t *testing.T) {
+		operator := &User{Role: RoleOperator}
+		got := scopedMachines(operator, all)
+		if len(got) != 0 {
+			t.Errorf("scopedMachines() = %v, want empty", got)
+		}
+	})
+
+	t.Run("manager sees everything unfiltered", func(t *testing.T) {
+		manager := &User{Role: RoleManager}
+		got := scopedMachines(manager, all)
+		if len(got) != len(all) {
+			t.Errorf("scopedMachines() = %d machines, want %d", len(got), len(all))
+		}
+	})
+}
