@@ -290,6 +290,27 @@ func newAlertID() string {
 
 // ── History ──────────────────────────────────────────────────────────
 
+// metricHistoryRetention bounds how long raw metric_history rows are kept.
+// Tick() inserts one row per active machine every 4s — at 10 active
+// machines that's ~216,000 rows/day, ~500MB/month. Render's free Postgres
+// plan caps out at 1GB, so without a retention policy the table alone
+// would exhaust it in roughly two months. 35 days (a little past the 30
+// days most reports/history views actually query) caps growth at a
+// steady-state size instead of letting it grow forever.
+const metricHistoryRetention = 35 * 24 * time.Hour
+
+// PruneMetricHistory deletes metric_history rows older than the retention
+// window. Intended to run periodically (see main.go), not on every tick —
+// pruning is a maintenance operation, not part of the hot path.
+func (s *Store) PruneMetricHistory(ctx context.Context) (int64, error) {
+	cutoff := time.Now().Add(-metricHistoryRetention)
+	tag, err := s.pool.Exec(ctx, `DELETE FROM metric_history WHERE timestamp < $1`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("prune metric_history: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (s *Store) History(machineID string, hours int) ([]MetricHistoryPoint, error) {
 	cutoff := time.Now().Add(-time.Duration(hours) * time.Hour)
 	rows, err := s.pool.Query(context.Background(), `SELECT timestamp, temperature, load, output, vibration, power_consumption

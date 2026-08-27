@@ -109,6 +109,19 @@ func (a *AuthManager) Logout(token string) bool {
 	return tag.RowsAffected() > 0
 }
 
+// PruneExpiredSessions deletes sessions past their expiry. UserForToken
+// already evicts a session the moment it's looked up after expiring, but a
+// session nobody ever looks up again (e.g. an abandoned tab) would
+// otherwise sit in the table forever — this is the periodic sweep for
+// those. Intended to run on a schedule (see main.go), not per-request.
+func (a *AuthManager) PruneExpiredSessions(ctx context.Context) (int64, error) {
+	tag, err := a.pool.Exec(ctx, `DELETE FROM sessions WHERE expires_at < now()`)
+	if err != nil {
+		return 0, fmt.Errorf("prune expired sessions: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
