@@ -34,6 +34,18 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// requireTestDBURL skips the test if no TEST_DATABASE_URL was configured,
+// otherwise returns it — for tests that need their own throwaway
+// connection (e.g. one they close mid-test) rather than the shared pool.
+func requireTestDBURL(t *testing.T) string {
+	t.Helper()
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping DB-backed test")
+	}
+	return url
+}
+
 // requireTestDB skips the test if no TEST_DATABASE_URL was configured,
 // otherwise wipes and reseeds the three demo users for test isolation.
 func requireTestDB(t *testing.T) *pgxpool.Pool {

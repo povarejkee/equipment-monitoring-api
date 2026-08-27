@@ -32,6 +32,14 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// writeDBError logs the underlying error and tells the client the request
+// failed — as opposed to silently returning an empty/null result, which for
+// a monitoring product is indistinguishable from "everything is fine."
+func writeDBError(w http.ResponseWriter, op string, err error) {
+	logger.Error(op, "error", err)
+	writeError(w, http.StatusBadGateway, "Сервис временно недоступен, попробуйте ещё раз")
+}
+
 // ── Auth ─────────────────────────────────────────────────────────────
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -40,7 +48,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Некорректный запрос")
 		return
 	}
-	user, token, ok := s.auth.Login(req.Email, req.Password)
+	user, token, ok, err := s.auth.Login(req.Email, req.Password)
+	if err != nil {
+		writeDBError(w, "login", err)
+		return
+	}
 	if !ok {
 		logger.Warn("failed login attempt", "email", req.Email, "ip", clientIP(r))
 		writeError(w, http.StatusUnauthorized, "Неверный email или пароль")
@@ -66,11 +78,20 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 // ── Machines ─────────────────────────────────────────────────────────
 
 func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.Machines())
+	machines, err := s.store.Machines()
+	if err != nil {
+		writeDBError(w, "list machines", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, machines)
 }
 
 func (s *Server) handleMachine(w http.ResponseWriter, r *http.Request) {
-	m := s.store.Machine(r.PathValue("id"))
+	m, err := s.store.Machine(r.PathValue("id"))
+	if err != nil {
+		writeDBError(w, "get machine", err)
+		return
+	}
 	if m == nil {
 		writeError(w, http.StatusNotFound, "Станок не найден")
 		return
@@ -85,16 +106,30 @@ func (s *Server) handleMachineHistory(w http.ResponseWriter, r *http.Request) {
 			hours = parsed
 		}
 	}
-	writeJSON(w, http.StatusOK, s.store.History(r.PathValue("id"), hours))
+	history, err := s.store.History(r.PathValue("id"), hours)
+	if err != nil {
+		writeDBError(w, "get machine history", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, history)
 }
 
 func (s *Server) handleMachineDowntimes(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.Downtimes(r.PathValue("id")))
+	downtimes, err := s.store.Downtimes(r.PathValue("id"))
+	if err != nil {
+		writeDBError(w, "get machine downtimes", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, downtimes)
 }
 
 func (s *Server) handleMachineAlerts(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	writeJSON(w, http.StatusOK, s.store.Alerts(AlertFilter{MachineID: id}))
+	alerts, err := s.store.Alerts(AlertFilter{MachineID: r.PathValue("id")})
+	if err != nil {
+		writeDBError(w, "get machine alerts", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, alerts)
 }
 
 // ── Alerts ───────────────────────────────────────────────────────────
@@ -115,7 +150,12 @@ func alertFilterFromQuery(r *http.Request) AlertFilter {
 }
 
 func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.Alerts(alertFilterFromQuery(r)))
+	alerts, err := s.store.Alerts(alertFilterFromQuery(r))
+	if err != nil {
+		writeDBError(w, "list alerts", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, alerts)
 }
 
 func (s *Server) handleAcknowledgeAlert(w http.ResponseWriter, r *http.Request) {
@@ -124,8 +164,20 @@ func (s *Server) handleAcknowledgeAlert(w http.ResponseWriter, r *http.Request) 
 	if user != nil {
 		uid = user.ID
 	}
-	s.store.AcknowledgeAlert(r.PathValue("id"), uid)
-	writeJSON(w, http.StatusOK, s.store.Alerts(AlertFilter{}))
+	if err := s.store.AcknowledgeAlert(r.PathValue("id"), uid); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Алерт не найден")
+			return
+		}
+		writeDBError(w, "acknowledge alert", err)
+		return
+	}
+	alerts, err := s.store.Alerts(AlertFilter{})
+	if err != nil {
+		writeDBError(w, "list alerts after acknowledge", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, alerts)
 }
 
 func (s *Server) handleAcknowledgeAll(w http.ResponseWriter, r *http.Request) {
@@ -134,14 +186,27 @@ func (s *Server) handleAcknowledgeAll(w http.ResponseWriter, r *http.Request) {
 	if user != nil {
 		uid = user.ID
 	}
-	s.store.AcknowledgeAllAlerts(uid)
-	writeJSON(w, http.StatusOK, s.store.Alerts(AlertFilter{}))
+	if err := s.store.AcknowledgeAllAlerts(uid); err != nil {
+		writeDBError(w, "acknowledge all alerts", err)
+		return
+	}
+	alerts, err := s.store.Alerts(AlertFilter{})
+	if err != nil {
+		writeDBError(w, "list alerts after acknowledge-all", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, alerts)
 }
 
 // ── Thresholds ───────────────────────────────────────────────────────
 
 func (s *Server) handleThresholds(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.Thresholds())
+	thresholds, err := s.store.Thresholds()
+	if err != nil {
+		writeDBError(w, "list thresholds", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, thresholds)
 }
 
 func (s *Server) handleUpdateThreshold(w http.ResponseWriter, r *http.Request) {
@@ -154,8 +219,24 @@ func (s *Server) handleUpdateThreshold(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Некорректный запрос")
 		return
 	}
-	s.store.UpdateThreshold(req.Metric, req.WarningValue, req.CriticalValue)
-	writeJSON(w, http.StatusOK, s.store.Thresholds())
+	if req.WarningValue > req.CriticalValue {
+		writeError(w, http.StatusBadRequest, "Предупредительный порог не может быть выше критического")
+		return
+	}
+	if err := s.store.UpdateThreshold(req.Metric, req.WarningValue, req.CriticalValue); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Метрика не найдена")
+			return
+		}
+		writeDBError(w, "update threshold", err)
+		return
+	}
+	thresholds, err := s.store.Thresholds()
+	if err != nil {
+		writeDBError(w, "list thresholds after update", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, thresholds)
 }
 
 // ── Errors ───────────────────────────────────────────────────────────
@@ -183,7 +264,11 @@ func (s *Server) handleErrors(w http.ResponseWriter, r *http.Request) {
 			f.To = &t
 		}
 	}
-	entries, total := s.store.ErrorLog(f)
+	entries, total, err := s.store.ErrorLog(f)
+	if err != nil {
+		writeDBError(w, "list error log", err)
+		return
+	}
 	w.Header().Set("X-Total-Count", strconv.Itoa(total))
 	writeJSON(w, http.StatusOK, entries)
 }
@@ -196,13 +281,23 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Некорректный запрос")
 		return
 	}
-	writeJSON(w, http.StatusOK, s.store.GenerateReport(p))
+	report, err := s.store.GenerateReport(p)
+	if err != nil {
+		writeDBError(w, "generate report", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
 }
 
 // ── Users (admin CRUD) ──────────────────────────────────────────────
 
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.Users())
+	users, err := s.store.Users()
+	if err != nil {
+		writeDBError(w, "list users", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, users)
 }
 
 func isValidRole(r UserRole) bool {
@@ -336,5 +431,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // ── WebSocket ────────────────────────────────────────────────────────
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	s.hub.HandleWS(w, r, s.store.Machines())
+	machines, err := s.store.Machines()
+	if err != nil {
+		// Best-effort: log it, but still let the socket connect — the
+		// next Tick() broadcast will carry real data once the DB blip
+		// (if any) has passed. An empty initial snapshot beats refusing
+		// the whole connection.
+		logger.Error("ws initial snapshot", "error", err)
+	}
+	s.hub.HandleWS(w, r, machines)
 }

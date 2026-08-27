@@ -57,14 +57,15 @@ func scanMachine(row pgx.Row) (*Machine, error) {
 
 // ── Machines ─────────────────────────────────────────────────────────
 
-func (s *Store) Machines() []*Machine {
-	ctx := context.Background()
+// Machines returns every machine. A query failure is returned rather than
+// swallowed: for a monitoring product, "the database is down" must not
+// render as "no machines".
+func (s *Store) Machines() ([]*Machine, error) {
 	// length-then-id sort keeps demo IDs like m1..m12 in numeric order
 	// instead of lexicographic (m1, m10, m11, ...).
-	rows, err := s.pool.Query(ctx, `SELECT `+machineColumns+` FROM machines ORDER BY length(id), id`)
+	rows, err := s.pool.Query(context.Background(), `SELECT `+machineColumns+` FROM machines ORDER BY length(id), id`)
 	if err != nil {
-		logger.Error("query machines", "error", err)
-		return nil
+		return nil, fmt.Errorf("query machines: %w", err)
 	}
 	defer rows.Close()
 
@@ -72,35 +73,41 @@ func (s *Store) Machines() []*Machine {
 	for rows.Next() {
 		m, err := scanMachine(rows)
 		if err != nil {
-			logger.Error("scan machine", "error", err)
-			continue
+			return nil, fmt.Errorf("scan machine: %w", err)
 		}
 		out = append(out, m)
 	}
-	return out
+	return out, rows.Err()
 }
 
-func (s *Store) Machine(id string) *Machine {
+// Machine returns one machine, or (nil, nil) if no such id exists.
+func (s *Store) Machine(id string) (*Machine, error) {
 	row := s.pool.QueryRow(context.Background(), `SELECT `+machineColumns+` FROM machines WHERE id=$1`, id)
 	m, err := scanMachine(row)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			logger.Error("query machine", "error", err, "id", id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
 		}
-		return nil
+		return nil, fmt.Errorf("query machine %s: %w", id, err)
 	}
-	return m
+	return m, nil
 }
 
 // Tick advances live metrics for all active machines and records a
 // metric_history point for each, then returns the fresh snapshot for
 // broadcasting over WebSocket. Machines that are offline/under maintenance
-// are left untouched but still included in the returned snapshot.
-func (s *Store) Tick() []*Machine {
+// are left untouched but still included in the returned snapshot. Returns
+// an error (and no machines) if the DB can't be reached at all — the
+// caller must NOT broadcast a nil/empty payload in that case, since that
+// would overwrite every connected client's good data with nothing.
+func (s *Store) Tick() ([]*Machine, error) {
 	ctx := context.Background()
-	machines := s.Machines()
+	machines, err := s.Machines()
+	if err != nil {
+		return nil, fmt.Errorf("tick: %w", err)
+	}
 	if len(machines) == 0 {
-		return machines
+		return machines, nil
 	}
 
 	s.rngMu.Lock()
@@ -109,7 +116,7 @@ func (s *Store) Tick() []*Machine {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		logger.Error("tick: begin tx", "error", err)
-		return machines
+		return machines, nil
 	}
 	defer tx.Rollback(ctx) // no-op once committed
 
@@ -158,7 +165,7 @@ func (s *Store) Tick() []*Machine {
 	if err := tx.Commit(ctx); err != nil {
 		logger.Error("tick: commit", "error", err)
 	}
-	return machines
+	return machines, nil
 }
 
 func (s *Store) updateStatus(m *Machine) {
@@ -182,13 +189,12 @@ func (s *Store) updateStatus(m *Machine) {
 
 // ── History ──────────────────────────────────────────────────────────
 
-func (s *Store) History(machineID string, hours int) []MetricHistoryPoint {
+func (s *Store) History(machineID string, hours int) ([]MetricHistoryPoint, error) {
 	cutoff := time.Now().Add(-time.Duration(hours) * time.Hour)
 	rows, err := s.pool.Query(context.Background(), `SELECT timestamp, temperature, load, output, vibration, power_consumption
 		FROM metric_history WHERE machine_id=$1 AND timestamp >= $2 ORDER BY timestamp ASC`, machineID, cutoff)
 	if err != nil {
-		logger.Error("query history", "error", err, "machineId", machineID)
-		return nil
+		return nil, fmt.Errorf("query history for %s: %w", machineID, err)
 	}
 	defer rows.Close()
 
@@ -196,22 +202,20 @@ func (s *Store) History(machineID string, hours int) []MetricHistoryPoint {
 	for rows.Next() {
 		var p MetricHistoryPoint
 		if err := rows.Scan(&p.Timestamp, &p.Temperature, &p.Load, &p.Output, &p.Vibration, &p.PowerConsumption); err != nil {
-			logger.Error("scan history point", "error", err)
-			continue
+			return nil, fmt.Errorf("scan history point: %w", err)
 		}
 		out = append(out, p)
 	}
-	return out
+	return out, rows.Err()
 }
 
 // ── Downtimes ────────────────────────────────────────────────────────
 
-func (s *Store) Downtimes(machineID string) []DowntimeEntry {
+func (s *Store) Downtimes(machineID string) ([]DowntimeEntry, error) {
 	rows, err := s.pool.Query(context.Background(), `SELECT id, machine_id, start_time, end_time, duration, reason
 		FROM downtimes WHERE machine_id=$1 ORDER BY start_time DESC`, machineID)
 	if err != nil {
-		logger.Error("query downtimes", "error", err, "machineId", machineID)
-		return nil
+		return nil, fmt.Errorf("query downtimes for %s: %w", machineID, err)
 	}
 	defer rows.Close()
 
@@ -219,12 +223,11 @@ func (s *Store) Downtimes(machineID string) []DowntimeEntry {
 	for rows.Next() {
 		var d DowntimeEntry
 		if err := rows.Scan(&d.ID, &d.MachineID, &d.StartTime, &d.EndTime, &d.Duration, &d.Reason); err != nil {
-			logger.Error("scan downtime", "error", err)
-			continue
+			return nil, fmt.Errorf("scan downtime: %w", err)
 		}
 		out = append(out, d)
 	}
-	return out
+	return out, rows.Err()
 }
 
 // ── Alerts ───────────────────────────────────────────────────────────
@@ -236,7 +239,7 @@ type AlertFilter struct {
 	Acknowledged *bool
 }
 
-func (s *Store) Alerts(f AlertFilter) []*Alert {
+func (s *Store) Alerts(f AlertFilter) ([]*Alert, error) {
 	query := `SELECT id, machine_id, machine_name, type, severity, message, metric_name,
 		current_value, threshold_value, timestamp, acknowledged, acknowledged_by, acknowledged_at
 		FROM alerts WHERE 1=1`
@@ -257,8 +260,7 @@ func (s *Store) Alerts(f AlertFilter) []*Alert {
 
 	rows, err := s.pool.Query(context.Background(), query, args...)
 	if err != nil {
-		logger.Error("query alerts", "error", err)
-		return nil
+		return nil, fmt.Errorf("query alerts: %w", err)
 	}
 	defer rows.Close()
 
@@ -268,41 +270,57 @@ func (s *Store) Alerts(f AlertFilter) []*Alert {
 		var ackBy *string
 		if err := rows.Scan(&a.ID, &a.MachineID, &a.MachineName, &a.Type, &a.Severity, &a.Message, &a.MetricName,
 			&a.CurrentValue, &a.ThresholdValue, &a.Timestamp, &a.Acknowledged, &ackBy, &a.AcknowledgedAt); err != nil {
-			logger.Error("scan alert", "error", err)
-			continue
+			return nil, fmt.Errorf("scan alert: %w", err)
 		}
 		if ackBy != nil {
 			a.AcknowledgedBy = *ackBy
 		}
 		out = append(out, &a)
 	}
-	return out
+	return out, rows.Err()
 }
 
-func (s *Store) AcknowledgeAlert(id, userID string) {
-	_, err := s.pool.Exec(context.Background(), `UPDATE alerts SET acknowledged=true, acknowledged_by=$2, acknowledged_at=now()
+// AcknowledgeAlert marks one alert acknowledged. Returns pgx.ErrNoRows if
+// the id doesn't exist or was already acknowledged, so the caller can 404
+// instead of silently reporting success either way.
+func (s *Store) AcknowledgeAlert(id, userID string) error {
+	tag, err := s.pool.Exec(context.Background(), `UPDATE alerts SET acknowledged=true, acknowledged_by=$2, acknowledged_at=now()
 		WHERE id=$1 AND acknowledged=false`, id, userID)
 	if err != nil {
-		logger.Error("acknowledge alert", "error", err, "id", id)
+		return fmt.Errorf("acknowledge alert %s: %w", id, err)
 	}
+	if tag.RowsAffected() == 0 {
+		// Distinguish "doesn't exist" from "already acknowledged" for a
+		// clearer error message.
+		var exists bool
+		if err := s.pool.QueryRow(context.Background(),
+			`SELECT EXISTS(SELECT 1 FROM alerts WHERE id=$1)`, id).Scan(&exists); err != nil {
+			return fmt.Errorf("check alert existence %s: %w", id, err)
+		}
+		if !exists {
+			return pgx.ErrNoRows
+		}
+		// Already acknowledged — not an error, just a no-op.
+	}
+	return nil
 }
 
-func (s *Store) AcknowledgeAllAlerts(userID string) {
+func (s *Store) AcknowledgeAllAlerts(userID string) error {
 	_, err := s.pool.Exec(context.Background(), `UPDATE alerts SET acknowledged=true, acknowledged_by=$1, acknowledged_at=now()
 		WHERE acknowledged=false`, userID)
 	if err != nil {
-		logger.Error("acknowledge all alerts", "error", err)
+		return fmt.Errorf("acknowledge all alerts: %w", err)
 	}
+	return nil
 }
 
 // ── Thresholds ───────────────────────────────────────────────────────
 
-func (s *Store) Thresholds() []*AlertThreshold {
+func (s *Store) Thresholds() ([]*AlertThreshold, error) {
 	rows, err := s.pool.Query(context.Background(),
 		`SELECT metric, label, unit, warning_value, critical_value FROM thresholds ORDER BY metric`)
 	if err != nil {
-		logger.Error("query thresholds", "error", err)
-		return nil
+		return nil, fmt.Errorf("query thresholds: %w", err)
 	}
 	defer rows.Close()
 
@@ -310,20 +328,25 @@ func (s *Store) Thresholds() []*AlertThreshold {
 	for rows.Next() {
 		var t AlertThreshold
 		if err := rows.Scan(&t.Metric, &t.Label, &t.Unit, &t.WarningValue, &t.CriticalValue); err != nil {
-			logger.Error("scan threshold", "error", err)
-			continue
+			return nil, fmt.Errorf("scan threshold: %w", err)
 		}
 		out = append(out, &t)
 	}
-	return out
+	return out, rows.Err()
 }
 
-func (s *Store) UpdateThreshold(metric string, warning, critical float64) {
-	_, err := s.pool.Exec(context.Background(),
+// UpdateThreshold updates one metric's thresholds. Returns pgx.ErrNoRows if
+// the metric doesn't exist, so callers can 404 instead of silently no-oping.
+func (s *Store) UpdateThreshold(metric string, warning, critical float64) error {
+	tag, err := s.pool.Exec(context.Background(),
 		`UPDATE thresholds SET warning_value=$2, critical_value=$3 WHERE metric=$1`, metric, warning, critical)
 	if err != nil {
-		logger.Error("update threshold", "error", err, "metric", metric)
+		return fmt.Errorf("update threshold %s: %w", metric, err)
 	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
 }
 
 // ── Error log ────────────────────────────────────────────────────────
@@ -340,7 +363,7 @@ type ErrorLogFilter struct {
 // ErrorLog returns entries matching f (newest-first) plus the total match
 // count before pagination, so callers can expose it (e.g. as a response
 // header) without a second request.
-func (s *Store) ErrorLog(f ErrorLogFilter) ([]*ErrorLogEntry, int) {
+func (s *Store) ErrorLog(f ErrorLogFilter) ([]*ErrorLogEntry, int, error) {
 	query := `SELECT id, machine_id, machine_name, error_code, error_type, description, timestamp,
 		resolved_at, resolved_by, duration, impact, COUNT(*) OVER() AS total_count
 		FROM error_log WHERE 1=1`
@@ -369,8 +392,7 @@ func (s *Store) ErrorLog(f ErrorLogFilter) ([]*ErrorLogEntry, int) {
 
 	rows, err := s.pool.Query(context.Background(), query, args...)
 	if err != nil {
-		logger.Error("query error log", "error", err)
-		return nil, 0
+		return nil, 0, fmt.Errorf("query error log: %w", err)
 	}
 	defer rows.Close()
 
@@ -381,25 +403,23 @@ func (s *Store) ErrorLog(f ErrorLogFilter) ([]*ErrorLogEntry, int) {
 		var resolvedBy *string
 		if err := rows.Scan(&e.ID, &e.MachineID, &e.MachineName, &e.ErrorCode, &e.ErrorType, &e.Description,
 			&e.Timestamp, &e.ResolvedAt, &resolvedBy, &e.Duration, &e.Impact, &total); err != nil {
-			logger.Error("scan error log entry", "error", err)
-			continue
+			return nil, 0, fmt.Errorf("scan error log entry: %w", err)
 		}
 		if resolvedBy != nil {
 			e.ResolvedBy = *resolvedBy
 		}
 		out = append(out, &e)
 	}
-	return out, total
+	return out, total, rows.Err()
 }
 
 // ── Users ────────────────────────────────────────────────────────────
 
-func (s *Store) Users() []*User {
+func (s *Store) Users() ([]*User, error) {
 	rows, err := s.pool.Query(context.Background(),
 		`SELECT id, name, email, role, assigned_machines FROM users ORDER BY id`)
 	if err != nil {
-		logger.Error("query users", "error", err)
-		return nil
+		return nil, fmt.Errorf("query users: %w", err)
 	}
 	defer rows.Close()
 
@@ -407,12 +427,11 @@ func (s *Store) Users() []*User {
 	for rows.Next() {
 		var u User
 		if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.Role, &u.AssignedMachines); err != nil {
-			logger.Error("scan user", "error", err)
-			continue
+			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		out = append(out, &u)
 	}
-	return out
+	return out, rows.Err()
 }
 
 // CreateUser inserts a new user with the given (already-hashed) password.
@@ -527,9 +546,19 @@ func isUniqueViolation(err error) bool {
 // error (0.5pp each, floored at 0) — a documented heuristic, not a raw
 // simulated number.
 
-func (s *Store) GenerateReport(p ReportParams) ReportData {
+// machineAggregate holds the raw sums behind one machine's report row.
+type machineAggregate struct {
+	totalOutput     float64
+	errorCount      int
+	downtimeMinutes float64
+}
+
+func (s *Store) GenerateReport(p ReportParams) (ReportData, error) {
 	ctx := context.Background()
-	machines := s.Machines()
+	machines, err := s.Machines()
+	if err != nil {
+		return ReportData{}, fmt.Errorf("report: %w", err)
+	}
 	filtered := make([]*Machine, 0)
 	for _, m := range machines {
 		if len(p.MachineIDs) == 0 || contains(p.MachineIDs, m.ID) {
@@ -541,47 +570,37 @@ func (s *Store) GenerateReport(p ReportParams) ReportData {
 		machineIDs[i] = m.ID
 	}
 
-	periodMinutes := p.DateTo.Sub(p.DateFrom).Minutes()
+	aggregates, err := s.machineAggregates(ctx, machineIDs, p.DateFrom, p.DateTo)
+	if err != nil {
+		return ReportData{}, fmt.Errorf("report: %w", err)
+	}
 
+	periodMinutes := p.DateTo.Sub(p.DateFrom).Minutes()
 	breakdown := make([]MachineReportRow, 0, len(filtered))
 	for _, m := range filtered {
-		var totalOutput, downtimeMinutes float64
-		var errorCount int
-		err := s.pool.QueryRow(ctx, `WITH mh AS (
-				SELECT COALESCE(SUM(output), 0) AS total_output FROM metric_history
-				WHERE machine_id=$1 AND timestamp >= $2 AND timestamp <= $3
-			), errs AS (
-				SELECT COUNT(*) AS cnt FROM error_log
-				WHERE machine_id=$1 AND timestamp >= $2 AND timestamp <= $3
-			), dt AS (
-				SELECT COALESCE(SUM(duration), 0) AS minutes FROM downtimes
-				WHERE machine_id=$1 AND start_time >= $2 AND start_time <= $3
-			)
-			SELECT mh.total_output, errs.cnt, dt.minutes FROM mh, errs, dt`,
-			m.ID, p.DateFrom, p.DateTo,
-		).Scan(&totalOutput, &errorCount, &downtimeMinutes)
-		if err != nil {
-			logger.Error("report: query machine aggregates", "error", err, "machineId", m.ID)
-		}
+		agg := aggregates[m.ID] // zero value if the machine had no activity in the window
 
 		uptimePercent := 100.0
 		if periodMinutes > 0 {
-			uptimePercent = clamp(100*(1-downtimeMinutes/periodMinutes), 0, 100)
+			uptimePercent = clamp(100*(1-agg.downtimeMinutes/periodMinutes), 0, 100)
 		}
-		efficiency := clamp(uptimePercent-float64(errorCount)*0.5, 0, 100)
+		efficiency := clamp(uptimePercent-float64(agg.errorCount)*0.5, 0, 100)
 
 		breakdown = append(breakdown, MachineReportRow{
 			MachineID:     m.ID,
 			MachineName:   m.Name,
-			TotalOutput:   math.Round(totalOutput),
+			TotalOutput:   math.Round(agg.totalOutput),
 			UptimePercent: round1(uptimePercent),
-			DowntimeHours: round1(downtimeMinutes / 60),
-			ErrorCount:    errorCount,
+			DowntimeHours: round1(agg.downtimeMinutes / 60),
+			ErrorCount:    agg.errorCount,
 			Efficiency:    round1(efficiency),
 		})
 	}
 
-	timeSeries := s.buildTimeSeries(ctx, p, machineIDs)
+	timeSeries, err := s.buildTimeSeries(ctx, p, machineIDs)
+	if err != nil {
+		return ReportData{}, fmt.Errorf("report: %w", err)
+	}
 
 	var totalOutput, sumUptime, totalDowntime, sumEff float64
 	var totalErrors int
@@ -608,38 +627,87 @@ func (s *Store) GenerateReport(p ReportParams) ReportData {
 		},
 		TimeSeries:       timeSeries,
 		MachineBreakdown: breakdown,
+	}, nil
+}
+
+// machineAggregates computes per-machine output/error/downtime totals for
+// [from, to] in a single round trip (previously 3 queries × N machines).
+func (s *Store) machineAggregates(ctx context.Context, machineIDs []string, from, to time.Time) (map[string]machineAggregate, error) {
+	out := make(map[string]machineAggregate, len(machineIDs))
+	if len(machineIDs) == 0 {
+		return out, nil
 	}
+
+	rows, err := s.pool.Query(ctx, `
+		WITH mh AS (
+			SELECT machine_id, COALESCE(SUM(output), 0) AS total_output
+			FROM metric_history WHERE machine_id = ANY($1) AND timestamp >= $2 AND timestamp <= $3
+			GROUP BY machine_id
+		), errs AS (
+			SELECT machine_id, COUNT(*) AS cnt FROM error_log
+			WHERE machine_id = ANY($1) AND timestamp >= $2 AND timestamp <= $3
+			GROUP BY machine_id
+		), dt AS (
+			SELECT machine_id, COALESCE(SUM(duration), 0) AS minutes FROM downtimes
+			WHERE machine_id = ANY($1) AND start_time >= $2 AND start_time <= $3
+			GROUP BY machine_id
+		)
+		SELECT ids.id, COALESCE(mh.total_output, 0), COALESCE(errs.cnt, 0), COALESCE(dt.minutes, 0)
+		FROM unnest($1::text[]) AS ids(id)
+		LEFT JOIN mh ON mh.machine_id = ids.id
+		LEFT JOIN errs ON errs.machine_id = ids.id
+		LEFT JOIN dt ON dt.machine_id = ids.id`,
+		machineIDs, from, to,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query machine aggregates: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id string
+		var agg machineAggregate
+		if err := rows.Scan(&id, &agg.totalOutput, &agg.errorCount, &agg.downtimeMinutes); err != nil {
+			return nil, fmt.Errorf("scan machine aggregate: %w", err)
+		}
+		out[id] = agg
+	}
+	return out, rows.Err()
 }
 
 // buildTimeSeries buckets metric_history/error_log into p.GroupBy-sized
 // windows starting at p.DateFrom (matching the original bucketing, which
 // isn't calendar-aligned). Uptime per bucket is derived from downtime
 // overlap rather than stored directly.
-func (s *Store) buildTimeSeries(ctx context.Context, p ReportParams, machineIDs []string) []TimeSeriesPoint {
+// bucketAggregate holds one time-series bucket's raw sums.
+type bucketAggregate struct {
+	output, avgTemp, avgLoad float64
+	errCount                 int
+}
+
+// buildTimeSeries buckets metric_history/error_log into p.GroupBy-sized
+// windows starting at p.DateFrom (matching the original bucketing, which
+// isn't calendar-aligned). Uptime per bucket is derived from downtime
+// overlap rather than stored directly. All buckets are computed in a
+// single query (previously one query per bucket — up to ~720 for an
+// hourly report over a month).
+func (s *Store) buildTimeSeries(ctx context.Context, p ReportParams, machineIDs []string) ([]TimeSeriesPoint, error) {
 	step := stepDuration(p.GroupBy)
-	downtimes := s.downtimesInRange(ctx, machineIDs, p.DateFrom, p.DateTo)
+	downtimes, err := s.downtimesInRange(ctx, machineIDs, p.DateFrom, p.DateTo)
+	if err != nil {
+		return nil, err
+	}
 	numMachines := len(machineIDs)
 
-	points := make([]TimeSeriesPoint, 0)
-	for t := p.DateFrom; !t.After(p.DateTo); t = t.Add(step) {
-		bucketEnd := t.Add(step)
+	buckets, err := s.bucketAggregates(ctx, machineIDs, p.DateFrom, p.DateTo, step)
+	if err != nil {
+		return nil, err
+	}
 
-		var output, avgTemp, avgLoad float64
-		var errCount int
-		err := s.pool.QueryRow(ctx, `WITH mh AS (
-				SELECT COALESCE(SUM(output), 0) AS output, COALESCE(AVG(temperature), 0) AS avg_temp,
-					COALESCE(AVG(load), 0) AS avg_load
-				FROM metric_history WHERE machine_id = ANY($1) AND timestamp >= $2 AND timestamp < $3
-			), errs AS (
-				SELECT COUNT(*) AS cnt FROM error_log
-				WHERE machine_id = ANY($1) AND timestamp >= $2 AND timestamp < $3
-			)
-			SELECT mh.output, mh.avg_temp, mh.avg_load, errs.cnt FROM mh, errs`,
-			machineIDs, t, bucketEnd,
-		).Scan(&output, &avgTemp, &avgLoad, &errCount)
-		if err != nil {
-			logger.Error("report: query bucket aggregates", "error", err)
-		}
+	points := make([]TimeSeriesPoint, 0)
+	for i, t := 0, p.DateFrom; !t.After(p.DateTo); i, t = i+1, t.Add(step) {
+		bucketEnd := t.Add(step)
+		agg := buckets[i] // zero value if nothing happened in this bucket
 
 		uptime := 100.0
 		if bucketMinutes := bucketEnd.Sub(t).Minutes(); numMachines > 0 && bucketMinutes > 0 {
@@ -649,14 +717,59 @@ func (s *Store) buildTimeSeries(ctx context.Context, p ReportParams, machineIDs 
 
 		points = append(points, TimeSeriesPoint{
 			Timestamp:      t,
-			Output:         math.Round(output),
+			Output:         math.Round(agg.output),
 			Uptime:         round1(uptime),
-			AvgTemperature: round1(avgTemp),
-			AvgLoad:        round1(avgLoad),
-			ErrorCount:     errCount,
+			AvgTemperature: round1(agg.avgTemp),
+			AvgLoad:        round1(agg.avgLoad),
+			ErrorCount:     agg.errCount,
 		})
 	}
-	return points
+	return points, nil
+}
+
+// bucketAggregates computes per-bucket sums by classifying every row into
+// bucket index floor((timestamp - from) / stepSeconds) in SQL — the same
+// arithmetic the caller uses to enumerate buckets from p.DateFrom, so the
+// map key lines up with the loop counter exactly.
+func (s *Store) bucketAggregates(ctx context.Context, machineIDs []string, from, to time.Time, step time.Duration) (map[int]bucketAggregate, error) {
+	out := make(map[int]bucketAggregate)
+	if len(machineIDs) == 0 {
+		return out, nil
+	}
+	stepSeconds := step.Seconds()
+
+	rows, err := s.pool.Query(ctx, `
+		WITH mh AS (
+			SELECT floor(extract(epoch FROM (timestamp - $2)) / $4)::bigint AS bucket,
+				COALESCE(SUM(output), 0) AS output,
+				COALESCE(AVG(temperature), 0) AS avg_temp,
+				COALESCE(AVG(load), 0) AS avg_load
+			FROM metric_history WHERE machine_id = ANY($1) AND timestamp >= $2 AND timestamp < $3
+			GROUP BY bucket
+		), errs AS (
+			SELECT floor(extract(epoch FROM (timestamp - $2)) / $4)::bigint AS bucket, COUNT(*) AS cnt
+			FROM error_log WHERE machine_id = ANY($1) AND timestamp >= $2 AND timestamp < $3
+			GROUP BY bucket
+		)
+		SELECT COALESCE(mh.bucket, errs.bucket), COALESCE(mh.output, 0), COALESCE(mh.avg_temp, 0),
+			COALESCE(mh.avg_load, 0), COALESCE(errs.cnt, 0)
+		FROM mh FULL OUTER JOIN errs ON mh.bucket = errs.bucket`,
+		machineIDs, from, to, stepSeconds,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query bucket aggregates: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var bucket int
+		var agg bucketAggregate
+		if err := rows.Scan(&bucket, &agg.output, &agg.avgTemp, &agg.avgLoad, &agg.errCount); err != nil {
+			return nil, fmt.Errorf("scan bucket aggregate: %w", err)
+		}
+		out[bucket] = agg
+	}
+	return out, rows.Err()
 }
 
 type downtimeInterval struct {
@@ -666,16 +779,15 @@ type downtimeInterval struct {
 // downtimesInRange fetches downtimes overlapping [from, to) for the given
 // machines once, so per-bucket uptime can be computed in Go instead of
 // re-querying per bucket.
-func (s *Store) downtimesInRange(ctx context.Context, machineIDs []string, from, to time.Time) []downtimeInterval {
+func (s *Store) downtimesInRange(ctx context.Context, machineIDs []string, from, to time.Time) ([]downtimeInterval, error) {
 	if len(machineIDs) == 0 {
-		return nil
+		return nil, nil
 	}
 	rows, err := s.pool.Query(ctx, `SELECT start_time, end_time FROM downtimes
 		WHERE machine_id = ANY($1) AND start_time < $3 AND (end_time IS NULL OR end_time > $2)`,
 		machineIDs, from, to)
 	if err != nil {
-		logger.Error("report: query downtimes", "error", err)
-		return nil
+		return nil, fmt.Errorf("query downtimes in range: %w", err)
 	}
 	defer rows.Close()
 
@@ -684,8 +796,7 @@ func (s *Store) downtimesInRange(ctx context.Context, machineIDs []string, from,
 		var start time.Time
 		var end *time.Time
 		if err := rows.Scan(&start, &end); err != nil {
-			logger.Error("report: scan downtime interval", "error", err)
-			continue
+			return nil, fmt.Errorf("scan downtime interval: %w", err)
 		}
 		e := to // treat a still-open downtime as ongoing through the window
 		if end != nil {
@@ -693,7 +804,7 @@ func (s *Store) downtimesInRange(ctx context.Context, machineIDs []string, from,
 		}
 		out = append(out, downtimeInterval{start: start, end: e})
 	}
-	return out
+	return out, rows.Err()
 }
 
 // overlapMinutes sums how many minutes of [from, to) each interval covers.

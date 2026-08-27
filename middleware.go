@@ -62,11 +62,16 @@ func recoverMiddleware(next http.Handler) http.Handler {
 }
 
 // authMiddleware requires a valid bearer token and injects the user into
-// the request context.
+// the request context. A DB failure while resolving the session is a 502,
+// never a 401 — see AuthManager.UserForToken.
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimSpace(bearerToken(r))
-		user := s.auth.UserForToken(token)
+		user, err := s.auth.UserForToken(token)
+		if err != nil {
+			writeDBError(w, "resolve session", err)
+			return
+		}
 		if user == nil {
 			writeError(w, http.StatusUnauthorized, "Не авторизован")
 			return

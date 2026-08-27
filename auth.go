@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -31,8 +32,11 @@ func NewAuthManager(pool *pgxpool.Pool) *AuthManager {
 }
 
 // Login verifies email/password against the stored bcrypt hash and, on
-// success, creates a new session and returns its token.
-func (a *AuthManager) Login(email, password string) (*User, string, bool) {
+// success, creates a new session and returns its token. ok is false for
+// wrong credentials; err is non-nil only for an actual infrastructure
+// failure (DB unreachable) — callers must tell these apart, since "wrong
+// password" is a 401 but "database is down" should never look like one.
+func (a *AuthManager) Login(email, password string) (user *User, token string, ok bool, err error) {
 	ctx := context.Background()
 	email = strings.ToLower(strings.TrimSpace(email))
 
@@ -40,22 +44,21 @@ func (a *AuthManager) Login(email, password string) (*User, string, bool) {
 	var passwordHash *string
 	row := a.pool.QueryRow(ctx,
 		`SELECT id, name, email, role, assigned_machines, password_hash FROM users WHERE email=$1`, email)
-	if err := row.Scan(&u.ID, &u.Name, &u.Email, &u.Role, &u.AssignedMachines, &passwordHash); err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			logger.Error("login: query user", "error", err)
+	if scanErr := row.Scan(&u.ID, &u.Name, &u.Email, &u.Role, &u.AssignedMachines, &passwordHash); scanErr != nil {
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			return nil, "", false, nil
 		}
-		return nil, "", false
+		return nil, "", false, fmt.Errorf("login: query user: %w", scanErr)
 	}
 	if passwordHash == nil || bcrypt.CompareHashAndPassword([]byte(*passwordHash), []byte(password)) != nil {
-		return nil, "", false
+		return nil, "", false, nil
 	}
 
-	token, err := a.createSession(ctx, u.ID)
-	if err != nil {
-		logger.Error("login: create session", "error", err, "userId", u.ID)
-		return nil, "", false
+	tok, sessErr := a.createSession(ctx, u.ID)
+	if sessErr != nil {
+		return nil, "", false, fmt.Errorf("login: create session: %w", sessErr)
 	}
-	return &u, token, true
+	return &u, tok, true, nil
 }
 
 func (a *AuthManager) createSession(ctx context.Context, userID string) (string, error) {
@@ -68,11 +71,15 @@ func (a *AuthManager) createSession(ctx context.Context, userID string) (string,
 	return token, nil
 }
 
-// UserForToken resolves the user behind a bearer token, if any. Expired
-// sessions are treated as absent and evicted.
-func (a *AuthManager) UserForToken(token string) *User {
+// UserForToken resolves the user behind a bearer token. A nil user with a
+// nil error means "no such session" (401); a non-nil error means the DB
+// couldn't be reached at all and the caller must not treat that as an
+// invalid token (502) — the frontend logs a user out on 401, so
+// mislabeling a DB blip as "unauthorized" would silently sign out every
+// active session on the next blip.
+func (a *AuthManager) UserForToken(token string) (*User, error) {
 	if token == "" {
-		return nil
+		return nil, nil
 	}
 	ctx := context.Background()
 	var u User
@@ -80,16 +87,16 @@ func (a *AuthManager) UserForToken(token string) *User {
 	row := a.pool.QueryRow(ctx, `SELECT u.id, u.name, u.email, u.role, u.assigned_machines, s.expires_at
 		FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash=$1`, hashToken(token))
 	if err := row.Scan(&u.ID, &u.Name, &u.Email, &u.Role, &u.AssignedMachines, &expiresAt); err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			logger.Error("resolve session", "error", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
 		}
-		return nil
+		return nil, fmt.Errorf("resolve session: %w", err)
 	}
 	if time.Now().After(expiresAt) {
 		a.Logout(token)
-		return nil
+		return nil, nil
 	}
-	return &u
+	return &u, nil
 }
 
 // Logout invalidates a session. Reports whether a session was found.

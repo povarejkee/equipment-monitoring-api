@@ -36,12 +36,20 @@ func main() {
 	srv := NewServer(store, auth, hub)
 	loginLimiter := newIPRateLimiter(5, time.Minute)
 
-	// Real-time loop: advance metrics every 4s and push to WS clients.
+	// Real-time loop: advance metrics every 4s and push to WS clients. A
+	// DB blip must not broadcast an empty/nil payload — that would
+	// overwrite every connected client's good data with nothing — so a
+	// failed tick is logged and skipped, not broadcast.
 	go func() {
 		ticker := time.NewTicker(4 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			hub.Broadcast("machines", store.Tick())
+			machines, err := store.Tick()
+			if err != nil {
+				logger.Error("tick failed, skipping broadcast", "error", err)
+				continue
+			}
+			hub.Broadcast("machines", machines)
 		}
 	}()
 
