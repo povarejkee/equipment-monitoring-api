@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -381,5 +382,61 @@ func TestTick_DoesNotDuplicateMaintenanceAlert(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("expected ticking 3x to still leave exactly 1 maintenance alert, got %d", count)
+	}
+}
+
+// TestTick_DoesNotRevertConcurrentManualStop is the regression test for a
+// real race found manually: Tick() reads its machine snapshot once at the
+// top, then updates each machine unconditionally. A SetMachineStatus call
+// that commits a manual stop in between those two moments used to get
+// silently reverted by Tick()'s own UPDATE — which also meant a "frozen"
+// machine's metrics kept drifting right after being stopped, briefly, in
+// the UI. Races real concurrent Tick() calls against one manual stop
+// rather than trying to force an exact interleaving.
+func TestTick_DoesNotRevertConcurrentManualStop(t *testing.T) {
+	pool := requireTestDB(t)
+	ctx := context.Background()
+	seedRunningMachine(t, pool, "m1")
+	store := NewStore(pool)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _ = store.Tick()
+			}
+		}
+	}()
+
+	time.Sleep(5 * time.Millisecond)
+	if _, err := store.SetMachineStatus("m1", StatusMaintenance, "race test"); err != nil {
+		t.Fatalf("SetMachineStatus: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond) // let several more concurrent ticks run
+	close(stop)
+	wg.Wait()
+
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM machines WHERE id='m1'`).Scan(&status); err != nil {
+		t.Fatalf("query status: %v", err)
+	}
+	if status != "maintenance" {
+		t.Fatalf("status = %q, want %q — a concurrent Tick() reverted the manual stop", status, "maintenance")
+	}
+
+	var openCount int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM downtimes WHERE machine_id='m1' AND end_time IS NULL`,
+	).Scan(&openCount); err != nil {
+		t.Fatalf("count open downtimes: %v", err)
+	}
+	if openCount != 1 {
+		t.Fatalf("open downtimes = %d, want 1 (got duplicated or lost)", openCount)
 	}
 }

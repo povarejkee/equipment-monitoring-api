@@ -161,12 +161,33 @@ func (s *Store) Tick() ([]*Machine, error) {
 		m.LastUpdated = now
 		s.updateStatus(m)
 
-		_, err := tx.Exec(ctx, `UPDATE machines SET status=$2, temperature=$3, load=$4, output=$5,
-			power_consumption=$6, spindle_speed=$7, vibration=$8, last_updated=$9, uptime=$10 WHERE id=$1`,
+		// The WHERE clause guards a real race: this machine's snapshot was
+		// read as "not stopped" at the top of Tick(), but SetMachineStatus
+		// (a separate transaction) can commit a manual stop in the
+		// meantime. Without the guard this UPDATE would win — since it
+		// runs unconditionally — and silently revert the manual stop back
+		// to a computed status while also overwriting the metrics a
+		// stopped machine is supposed to hold steady. If 0 rows match,
+		// the manual stop won the race; skip the rest of this machine's
+		// tick work (history/alerts) since it's no longer running.
+		tag, err := tx.Exec(ctx, `UPDATE machines SET status=$2, temperature=$3, load=$4, output=$5,
+			power_consumption=$6, spindle_speed=$7, vibration=$8, last_updated=$9, uptime=$10
+			WHERE id=$1 AND status NOT IN ('offline', 'maintenance')`,
 			m.ID, m.Status, m.Metrics.Temperature, m.Metrics.Load, m.Metrics.Output,
 			m.Metrics.PowerConsumption, m.Metrics.SpindleSpeed, m.Metrics.Vibration, m.LastUpdated, m.Metrics.Uptime)
 		if err != nil {
 			logger.Error("tick: update machine", "error", err, "id", m.ID)
+			continue
+		}
+		if tag.RowsAffected() == 0 {
+			// Replace the stale in-memory copy with the machine's actual
+			// current state before it goes out in this tick's WS
+			// broadcast — otherwise clients would briefly see the
+			// computed-but-never-persisted status/metrics this loop just
+			// lost the race to write.
+			if fresh, ferr := scanMachine(tx.QueryRow(ctx, `SELECT `+machineColumns+` FROM machines WHERE id=$1`, m.ID)); ferr == nil {
+				*m = *fresh
+			}
 			continue
 		}
 
