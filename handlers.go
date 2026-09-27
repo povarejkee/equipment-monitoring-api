@@ -113,6 +113,61 @@ func (s *Server) handleMachine(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m)
 }
 
+type updateMachineStatusRequest struct {
+	Status MachineStatus `json:"status"`
+	Reason string        `json:"reason,omitempty"`
+}
+
+// handleUpdateMachineStatus manually stops/resumes a machine — the only
+// way in or out of maintenance/offline (Tick() otherwise leaves those
+// alone forever). Manager/admin only: see requireRoles on the route.
+func (s *Server) handleUpdateMachineStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req updateMachineStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Некорректный запрос")
+		return
+	}
+	m, err := s.store.SetMachineStatus(id, req.Status, req.Reason)
+	if err != nil {
+		if errors.Is(err, errInvalidStatus) {
+			writeError(w, http.StatusBadRequest, "Статус должен быть одним из: running, maintenance, offline")
+			return
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Станок не найден")
+			return
+		}
+		writeDBError(w, "update machine status", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+type updateMaintenanceScheduleRequest struct {
+	// nil/omitted clears the schedule.
+	NextMaintenanceAt *time.Time `json:"nextMaintenanceAt"`
+}
+
+func (s *Server) handleUpdateMaintenanceSchedule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req updateMaintenanceScheduleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Некорректный запрос")
+		return
+	}
+	m, err := s.store.SetMaintenanceSchedule(id, req.NextMaintenanceAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Станок не найден")
+			return
+		}
+		writeDBError(w, "update maintenance schedule", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
 func (s *Server) handleMachineHistory(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !canAccessMachine(userFromContext(r), id) {

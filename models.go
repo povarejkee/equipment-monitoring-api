@@ -36,14 +36,15 @@ type MachineMetrics struct {
 }
 
 type Machine struct {
-	ID               string         `json:"id"`
-	Name             string         `json:"name"`
-	Type             MachineType    `json:"type"`
-	Location         string         `json:"location"`
-	Status           MachineStatus  `json:"status"`
-	Metrics          MachineMetrics `json:"metrics"`
-	LastUpdated      time.Time      `json:"lastUpdated"`
-	AssignedOperator string         `json:"assignedOperator,omitempty"`
+	ID                string         `json:"id"`
+	Name              string         `json:"name"`
+	Type              MachineType    `json:"type"`
+	Location          string         `json:"location"`
+	Status            MachineStatus  `json:"status"`
+	Metrics           MachineMetrics `json:"metrics"`
+	LastUpdated       time.Time      `json:"lastUpdated"`
+	AssignedOperator  string         `json:"assignedOperator,omitempty"`
+	NextMaintenanceAt *time.Time     `json:"nextMaintenanceAt,omitempty"`
 }
 
 type MetricHistoryPoint struct {

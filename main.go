@@ -117,6 +117,8 @@ func main() {
 	mux.HandleFunc("POST /api/auth/logout", srv.authMiddleware(srv.handleLogout))
 	mux.HandleFunc("GET /api/machines", srv.authMiddleware(srv.handleMachines))
 	mux.HandleFunc("GET /api/machines/{id}", srv.authMiddleware(srv.handleMachine))
+	mux.HandleFunc("PUT /api/machines/{id}/status", srv.authMiddleware(requireRoles([]UserRole{RoleManager, RoleAdmin}, srv.handleUpdateMachineStatus)))
+	mux.HandleFunc("PUT /api/machines/{id}/maintenance-schedule", srv.authMiddleware(requireRoles([]UserRole{RoleManager, RoleAdmin}, srv.handleUpdateMaintenanceSchedule)))
 	mux.HandleFunc("GET /api/machines/{id}/history", srv.authMiddleware(srv.handleMachineHistory))
 	mux.HandleFunc("GET /api/machines/{id}/downtimes", srv.authMiddleware(srv.handleMachineDowntimes))
 	mux.HandleFunc("GET /api/machines/{id}/alerts", srv.authMiddleware(srv.handleMachineAlerts))

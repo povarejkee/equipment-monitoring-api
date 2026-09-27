@@ -36,7 +36,8 @@ func NewStore(pool *pgxpool.Pool) *Store {
 }
 
 const machineColumns = `id, name, type, location, status, assigned_operator,
-	temperature, load, output, uptime, power_consumption, spindle_speed, vibration, last_updated`
+	temperature, load, output, uptime, power_consumption, spindle_speed, vibration, last_updated,
+	next_maintenance_at`
 
 func scanMachine(row pgx.Row) (*Machine, error) {
 	var m Machine
@@ -45,6 +46,7 @@ func scanMachine(row pgx.Row) (*Machine, error) {
 		&m.ID, &m.Name, &m.Type, &m.Location, &m.Status, &assignedOperator,
 		&m.Metrics.Temperature, &m.Metrics.Load, &m.Metrics.Output, &m.Metrics.Uptime, &m.Metrics.PowerConsumption,
 		&m.Metrics.SpindleSpeed, &m.Metrics.Vibration, &m.LastUpdated,
+		&m.NextMaintenanceAt,
 	)
 	if err != nil {
 		return nil, err
@@ -145,13 +147,24 @@ func (s *Store) Tick() ([]*Machine, error) {
 			v := fluctuate(s.rng, *m.Metrics.SpindleSpeed, 50, 500, 3000)
 			m.Metrics.SpindleSpeed = &v
 		}
+
+		// Uptime is "hours since this machine last stopped" — it only
+		// advances here because offline/maintenance machines never reach
+		// this loop body (they're `continue`d above), and SetMachineStatus
+		// resets it to 0 the moment one of them stops. Measured against
+		// the previous tick's timestamp (not a hardcoded 4s) so it stays
+		// accurate regardless of actual ticker timing; capped at 1h/tick
+		// so a long server restart doesn't produce an implausible jump.
+		elapsedHours := math.Min(1, math.Max(0, now.Sub(m.LastUpdated).Hours()))
+		m.Metrics.Uptime = round1(m.Metrics.Uptime + elapsedHours)
+
 		m.LastUpdated = now
 		s.updateStatus(m)
 
 		_, err := tx.Exec(ctx, `UPDATE machines SET status=$2, temperature=$3, load=$4, output=$5,
-			power_consumption=$6, spindle_speed=$7, vibration=$8, last_updated=$9 WHERE id=$1`,
+			power_consumption=$6, spindle_speed=$7, vibration=$8, last_updated=$9, uptime=$10 WHERE id=$1`,
 			m.ID, m.Status, m.Metrics.Temperature, m.Metrics.Load, m.Metrics.Output,
-			m.Metrics.PowerConsumption, m.Metrics.SpindleSpeed, m.Metrics.Vibration, m.LastUpdated)
+			m.Metrics.PowerConsumption, m.Metrics.SpindleSpeed, m.Metrics.Vibration, m.LastUpdated, m.Metrics.Uptime)
 		if err != nil {
 			logger.Error("tick: update machine", "error", err, "id", m.ID)
 			continue
@@ -170,6 +183,7 @@ func (s *Store) Tick() ([]*Machine, error) {
 		}
 
 		s.checkThresholdAlerts(ctx, tx, m, thresholds)
+		s.checkMaintenanceDueAlert(ctx, tx, m)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -288,6 +302,49 @@ func newAlertID() string {
 	return "alert-" + hex.EncodeToString(b)
 }
 
+// maintenanceDueWindow is how far in advance of a scheduled maintenance
+// date checkMaintenanceDueAlert raises a warning. Also used as the cutoff
+// on the overdue side: a date more than this far in the past stops
+// generating new alerts, since re-alerting forever on a date nobody
+// updated is noise, not a reminder.
+const maintenanceDueWindow = 48 * time.Hour
+
+// checkMaintenanceDueAlert raises a maintenance_due alert once a machine's
+// NextMaintenanceAt falls within maintenanceDueWindow — this is the first
+// thing that actually uses that alert type; previously it existed only in
+// the seed data and nothing ever generated one at runtime.
+func (s *Store) checkMaintenanceDueAlert(ctx context.Context, tx pgx.Tx, m *Machine) {
+	if m.NextMaintenanceAt == nil {
+		return
+	}
+	until := time.Until(*m.NextMaintenanceAt)
+	if until > maintenanceDueWindow || until < -maintenanceDueWindow {
+		return
+	}
+
+	var alreadyOpen bool
+	err := tx.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM alerts WHERE machine_id=$1 AND type=$2 AND acknowledged=false)`,
+		m.ID, AlertMaintenanceDue,
+	).Scan(&alreadyOpen)
+	if err != nil {
+		logger.Error("tick: check maintenance alert", "error", err, "machineId", m.ID)
+		return
+	}
+	if alreadyOpen {
+		return
+	}
+
+	message := fmt.Sprintf("%s: плановое ТО назначено на %s", m.Name, m.NextMaintenanceAt.Format("02.01.2006 15:04"))
+	_, err = tx.Exec(ctx, `INSERT INTO alerts
+		(id, machine_id, machine_name, type, severity, message, metric_name, current_value, threshold_value, timestamp, acknowledged)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false)`,
+		newAlertID(), m.ID, m.Name, AlertMaintenanceDue, SeverityInfo, message, "uptime", 0, 0, time.Now())
+	if err != nil {
+		logger.Error("tick: insert maintenance alert", "error", err, "machineId", m.ID)
+	}
+}
+
 // ── History ──────────────────────────────────────────────────────────
 
 // metricHistoryRetention bounds how long raw metric_history rows are kept.
@@ -350,6 +407,123 @@ func (s *Store) Downtimes(machineID string) ([]DowntimeEntry, error) {
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// errInvalidStatus is returned by SetMachineStatus for any status not in
+// manualStatuses; handlers map it to 400.
+var errInvalidStatus = errors.New("status must be one of: running, maintenance, offline")
+
+// manualStatuses are the only statuses SetMachineStatus accepts. The rest
+// (warning/error/idle) are derived from live metrics by updateStatus() and
+// would just be overwritten on the next tick — offline/maintenance are the
+// two Tick() actually freezes on, and running is how you resume from them.
+var manualStatuses = map[MachineStatus]bool{
+	StatusRunning:     true,
+	StatusMaintenance: true,
+	StatusOffline:     true,
+}
+
+func isStopped(status MachineStatus) bool {
+	return status == StatusOffline || status == StatusMaintenance
+}
+
+// SetMachineStatus manually moves a machine into or out of
+// maintenance/offline (Tick() otherwise never changes those — a machine
+// that entered either state used to stay there forever, with no endpoint
+// to bring it back). Stopping opens a new downtime record and resets the
+// uptime counter; resuming closes the open downtime. Returns
+// pgx.ErrNoRows if the machine doesn't exist, and a plain error (checked
+// by the caller with errInvalidStatus) for a status this method doesn't
+// accept.
+func (s *Store) SetMachineStatus(id string, newStatus MachineStatus, reason string) (*Machine, error) {
+	if !manualStatuses[newStatus] {
+		return nil, errInvalidStatus
+	}
+	ctx := context.Background()
+
+	current, err := s.Machine(id)
+	if err != nil {
+		return nil, fmt.Errorf("set machine status: %w", err)
+	}
+	if current == nil {
+		return nil, pgx.ErrNoRows
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("set machine status: begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	now := time.Now()
+	wasStopped, willBeStopped := isStopped(current.Status), isStopped(newStatus)
+
+	switch {
+	case !wasStopped && willBeStopped:
+		// Starting a stoppage: open a downtime record and reset the
+		// "hours since last stop" counter.
+		if reason == "" {
+			reason = "Остановлен вручную"
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO downtimes (id, machine_id, start_time, reason) VALUES ($1,$2,$3,$4)`,
+			newDowntimeID(id), id, now, reason); err != nil {
+			return nil, fmt.Errorf("set machine status: open downtime: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE machines SET status=$2, uptime=0, last_updated=$3 WHERE id=$1`,
+			id, newStatus, now); err != nil {
+			return nil, fmt.Errorf("set machine status: update machine: %w", err)
+		}
+
+	case wasStopped && !willBeStopped:
+		// Resuming: close whichever downtime is still open. There should
+		// be exactly one (SetMachineStatus is the only thing that opens
+		// or closes them), but guard with an ORDER BY + LIMIT 1 in case
+		// of manual DB edits or a bug leaving more than one open.
+		if _, err := tx.Exec(ctx, `UPDATE downtimes SET end_time=$2, duration=ROUND(EXTRACT(EPOCH FROM ($2 - start_time))/60)::int
+			WHERE id = (SELECT id FROM downtimes WHERE machine_id=$1 AND end_time IS NULL ORDER BY start_time DESC LIMIT 1)`,
+			id, now); err != nil {
+			return nil, fmt.Errorf("set machine status: close downtime: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE machines SET status=$2, last_updated=$3 WHERE id=$1`,
+			id, newStatus, now); err != nil {
+			return nil, fmt.Errorf("set machine status: update machine: %w", err)
+		}
+
+	default:
+		// running->running or switching directly between offline<->maintenance:
+		// no downtime bookkeeping change, just the status.
+		if _, err := tx.Exec(ctx, `UPDATE machines SET status=$2, last_updated=$3 WHERE id=$1`,
+			id, newStatus, now); err != nil {
+			return nil, fmt.Errorf("set machine status: update machine: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("set machine status: commit: %w", err)
+	}
+	return s.Machine(id)
+}
+
+// SetMaintenanceSchedule sets (or, with nil, clears) the next scheduled
+// maintenance date. Tick() raises a maintenance_due alert as that date
+// approaches (see checkMaintenanceDueAlert). Returns pgx.ErrNoRows if the
+// machine doesn't exist.
+func (s *Store) SetMaintenanceSchedule(id string, at *time.Time) (*Machine, error) {
+	tag, err := s.pool.Exec(context.Background(),
+		`UPDATE machines SET next_maintenance_at=$2 WHERE id=$1`, id, at)
+	if err != nil {
+		return nil, fmt.Errorf("set maintenance schedule: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, pgx.ErrNoRows
+	}
+	return s.Machine(id)
+}
+
+func newDowntimeID(machineID string) string {
+	b := make([]byte, 4)
+	_, _ = crand.Read(b)
+	return fmt.Sprintf("dt-%s-%s", machineID, hex.EncodeToString(b))
 }
 
 // ── Alerts ───────────────────────────────────────────────────────────
