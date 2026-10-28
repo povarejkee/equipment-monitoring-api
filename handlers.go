@@ -249,13 +249,44 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// visibleAlerts returns every alert the caller may see (operators: only
+// their assigned machines) — used for the post-acknowledge responses so
+// an operator's acknowledge never leaks other machines' alerts.
+func (s *Server) visibleAlerts(user *User) ([]*Alert, error) {
+	alerts, err := s.store.Alerts(AlertFilter{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Alert, 0, len(alerts))
+	for _, a := range alerts {
+		if canAccessMachine(user, a.MachineID) {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
 func (s *Server) handleAcknowledgeAlert(w http.ResponseWriter, r *http.Request) {
 	user := userFromContext(r)
 	uid := "unknown"
 	if user != nil {
 		uid = user.ID
 	}
-	if err := s.store.AcknowledgeAlert(r.PathValue("id"), uid); err != nil {
+	id := r.PathValue("id")
+	alert, err := s.store.Alert(id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Алерт не найден")
+			return
+		}
+		writeDBError(w, "get alert", err)
+		return
+	}
+	if !canAccessMachine(user, alert.MachineID) {
+		writeForbiddenMachine(w)
+		return
+	}
+	if err := s.store.AcknowledgeAlert(id, uid); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "Алерт не найден")
 			return
@@ -263,7 +294,7 @@ func (s *Server) handleAcknowledgeAlert(w http.ResponseWriter, r *http.Request) 
 		writeDBError(w, "acknowledge alert", err)
 		return
 	}
-	alerts, err := s.store.Alerts(AlertFilter{})
+	alerts, err := s.visibleAlerts(user)
 	if err != nil {
 		writeDBError(w, "list alerts after acknowledge", err)
 		return
@@ -274,14 +305,18 @@ func (s *Server) handleAcknowledgeAlert(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleAcknowledgeAll(w http.ResponseWriter, r *http.Request) {
 	user := userFromContext(r)
 	uid := "unknown"
+	var scope []string
 	if user != nil {
 		uid = user.ID
+		if user.Role == RoleOperator {
+			scope = append([]string{}, user.AssignedMachines...)
+		}
 	}
-	if err := s.store.AcknowledgeAllAlerts(uid); err != nil {
+	if err := s.store.AcknowledgeAllAlerts(uid, scope); err != nil {
 		writeDBError(w, "acknowledge all alerts", err)
 		return
 	}
-	alerts, err := s.store.Alerts(AlertFilter{})
+	alerts, err := s.visibleAlerts(user)
 	if err != nil {
 		writeDBError(w, "list alerts after acknowledge-all", err)
 		return

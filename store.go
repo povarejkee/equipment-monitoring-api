@@ -622,13 +622,39 @@ func (s *Store) AcknowledgeAlert(id, userID string) error {
 	return nil
 }
 
-func (s *Store) AcknowledgeAllAlerts(userID string) error {
-	_, err := s.pool.Exec(context.Background(), `UPDATE alerts SET acknowledged=true, acknowledged_by=$1, acknowledged_at=now()
-		WHERE acknowledged=false`, userID)
-	if err != nil {
+// AcknowledgeAllAlerts acknowledges every open alert, or — when machineIDs
+// is non-nil — only those on the given machines (an operator's own). A
+// non-nil empty slice acknowledges nothing, matching canAccessMachine's
+// fail-closed rule for an operator with no assigned machines.
+func (s *Store) AcknowledgeAllAlerts(userID string, machineIDs []string) error {
+	query := `UPDATE alerts SET acknowledged=true, acknowledged_by=$1, acknowledged_at=now()
+		WHERE acknowledged=false`
+	args := []interface{}{userID}
+	if machineIDs != nil {
+		query += ` AND machine_id = ANY($2)`
+		args = append(args, machineIDs)
+	}
+	if _, err := s.pool.Exec(context.Background(), query, args...); err != nil {
 		return fmt.Errorf("acknowledge all alerts: %w", err)
 	}
 	return nil
+}
+
+// Alert returns one alert by id, or pgx.ErrNoRows.
+func (s *Store) Alert(id string) (*Alert, error) {
+	var a Alert
+	var ackBy *string
+	err := s.pool.QueryRow(context.Background(), `SELECT id, machine_id, machine_name, type, severity, message, metric_name,
+		current_value, threshold_value, timestamp, acknowledged, acknowledged_by, acknowledged_at
+		FROM alerts WHERE id=$1`, id).Scan(&a.ID, &a.MachineID, &a.MachineName, &a.Type, &a.Severity, &a.Message, &a.MetricName,
+		&a.CurrentValue, &a.ThresholdValue, &a.Timestamp, &a.Acknowledged, &ackBy, &a.AcknowledgedAt)
+	if err != nil {
+		return nil, err
+	}
+	if ackBy != nil {
+		a.AcknowledgedBy = *ackBy
+	}
+	return &a, nil
 }
 
 // ── Thresholds ───────────────────────────────────────────────────────
