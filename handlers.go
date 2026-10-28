@@ -13,13 +13,14 @@ import (
 )
 
 type Server struct {
-	store *Store
-	auth  *AuthManager
-	hub   *Hub
+	store    *Store
+	auth     *AuthManager
+	hub      *Hub
+	telegram *TelegramNotifier
 }
 
 func NewServer(store *Store, auth *AuthManager, hub *Hub) *Server {
-	return &Server{store: store, auth: auth, hub: hub}
+	return &Server{store: store, auth: auth, hub: hub, telegram: NewTelegramNotifierFromEnv()}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

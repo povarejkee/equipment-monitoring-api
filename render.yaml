@@ -20,3 +20,9 @@ services:
         fromDatabase:
           name: equipment-monitoring-db
           property: connectionString
+      # Optional Telegram alert notifications — set both in the Render
+      # dashboard (sync: false keeps the values out of the repo).
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

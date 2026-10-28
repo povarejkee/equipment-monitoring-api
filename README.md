@@ -34,6 +34,11 @@ Env vars:
 - `ALLOWED_ORIGINS` — comma-separated CORS allowlist. Leaving it unset opens
   CORS to `*` (fine for local dev; the server logs a warning) — production
   (`render.yaml`) sets it explicitly to the deployed frontend origin.
+- `SHIFT_TIMEZONE` — IANA zone the shift/OEE day boundaries use (default
+  `Europe/Moscow`).
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — enable Telegram alert
+  notifications (see [Telegram notifications](#telegram-notifications));
+  `TELEGRAM_MIN_SEVERITY` = `critical` (default) | `warning` | `info`.
 
 ## Database
 
@@ -184,6 +189,40 @@ by `groupBy` (`hour`/`day`/`week`/`month`, default `day`) starting at
 - **Efficiency** — has no directly stored source, so it's a documented
   heuristic: uptime minus 0.5 percentage points per error, floored at 0.
 
+## Shift reports and OEE
+
+`GET /api/reports/shifts?dateFrom=&dateTo=&machineIds=` aggregates output,
+availability, downtime, errors and average load per 8-hour shift (night
+00–08, day 08–16, evening 16–24) and per machine. `GET /api/oee` (same
+date params, max 31 days) computes OEE = availability × performance ×
+quality per machine, per day and fleet-wide:
+
+- **Availability** — `1 − downtime / planned time` (downtimes table).
+- **Performance** — actual output ÷ ideal output. `metric_history` rows
+  exist only while a machine runs, so their mean is the running rate;
+  produced parts = rate × running hours, ideal = `machines.rated_output`
+  (parts/hour, set per machine via `PUT /api/machines/{id}/rated-output`)
+  × running hours. Capped at 100%.
+- **Quality** — `1 − scrap / produced`, scrap from `scrap_records`
+  (`POST /api/machines/{id}/scrap`).
+
+Aggregates are weighted (sum the raw quantities, then divide) — never an
+average of percentages. Day/shift boundaries are wall-clock in
+`SHIFT_TIMEZONE`, and a downtime crossing a boundary is split between the
+two periods. Operators only ever get their own machines.
+
+## Telegram notifications
+
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` and new alerts at or above
+`TELEGRAM_MIN_SEVERITY` (default `critical`) are pushed to that chat.
+Delivery is queued and non-blocking (a slow/unreachable Telegram can't
+stall `Tick()`), retried with backoff on network errors/429/5xx, and only
+sent **after** the transaction that created the alert commits. The token
+is scrubbed from any error text. `GET /api/notifications/telegram` (admin)
+shows status; `POST /api/notifications/telegram/test` sends a test message.
+A critical crossing is raised even while an older *warning* on the same
+metric is still unacknowledged.
+
 ## Logging
 
 Structured JSON logs via `log/slog` (stdout). Logged: server start/stop,
@@ -211,7 +250,17 @@ handler and returns `500` instead of crashing the process.
 | GET | `/api/thresholds` | ✓ | alert thresholds |
 | PUT | `/api/thresholds` | ✓ | update a threshold (rejects warning > critical) |
 | GET | `/api/errors?limit=&offset=&machine_id=&from=&to=` | ✓ scoped | error log, paginated/filtered (all optional; total match count in `X-Total-Count`) |
-| POST | `/api/reports` | ✓ | generate report |
+| POST | `/api/reports` | ✓ scoped | generate report |
+| GET | `/api/reports/shifts?dateFrom=&dateTo=&machineIds=` | ✓ scoped | per-shift/per-machine report |
+| GET | `/api/oee?dateFrom=&dateTo=&machineIds=` | ✓ scoped | OEE: per machine, per day, fleet |
+| PUT | `/api/machines/{id}/status` | manager/admin | `{status,reason?}` stop/resume a machine |
+| PUT | `/api/machines/{id}/maintenance-schedule` | manager/admin | `{nextMaintenanceAt}` (null clears) |
+| PUT | `/api/machines/{id}/rated-output` | manager/admin | `{ratedOutput}` parts/hour |
+| GET | `/api/machines/{id}/scrap?limit=` | ✓ scoped | scrap log |
+| POST | `/api/machines/{id}/scrap` | ✓ scoped | `{count,reason?,occurredAt?}` log scrap |
+| DELETE | `/api/scrap/{id}` | manager/admin | delete a scrap record |
+| GET | `/api/notifications/telegram` | admin | Telegram status |
+| POST | `/api/notifications/telegram/test` | admin | send a test message |
 | GET | `/api/users` | manager/admin | users |
 | POST | `/api/users` | admin | create user `{name,email,password,role,assignedMachines?}` |
 | PUT | `/api/users/{id}` | admin | partial update (any subset of the create fields) |

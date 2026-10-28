@@ -37,6 +37,10 @@ func main() {
 	hub := NewHub()
 	srv := NewServer(store, auth, hub)
 	loginLimiter := newIPRateLimiter(5, time.Minute)
+	store.SetNotifier(srv.telegram)
+	if srv.telegram.Enabled() {
+		logger.Info("telegram notifications enabled", "minSeverity", srv.telegram.Status().MinSeverity)
+	}
 
 	// bgCtx cancels the background loops below on shutdown, between ticks
 	// — not mid-tick. A bare SIGTERM previously killed the process
@@ -45,6 +49,8 @@ func main() {
 	// shutdown sequence at the bottom of main).
 	bgCtx, cancelBg := context.WithCancel(context.Background())
 	defer cancelBg()
+
+	go srv.telegram.Run(bgCtx)
 
 	// Real-time loop: advance metrics every 4s and push to WS clients. A
 	// DB blip must not broadcast an empty/nil payload — that would
@@ -130,6 +136,8 @@ func main() {
 	mux.HandleFunc("GET /api/errors", srv.authMiddleware(srv.handleErrors))
 	mux.HandleFunc("POST /api/reports", srv.authMiddleware(srv.handleReport))
 	mux.HandleFunc("GET /api/reports/shifts", srv.authMiddleware(srv.handleShiftReport))
+	mux.HandleFunc("GET /api/notifications/telegram", srv.authMiddleware(requireRole(RoleAdmin, srv.handleTelegramStatus)))
+	mux.HandleFunc("POST /api/notifications/telegram/test", srv.authMiddleware(requireRole(RoleAdmin, srv.handleTelegramTest)))
 	mux.HandleFunc("GET /api/oee", srv.authMiddleware(srv.handleOEEReport))
 	mux.HandleFunc("GET /api/machines/{id}/scrap", srv.authMiddleware(srv.handleMachineScrap))
 	mux.HandleFunc("POST /api/machines/{id}/scrap", srv.authMiddleware(srv.handleAddScrap))

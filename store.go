@@ -26,7 +26,13 @@ type Store struct {
 	pool  *pgxpool.Pool
 	rng   *rand.Rand
 	rngMu sync.Mutex
+	// notifier, if set, is told about alerts Tick() created — only after
+	// the transaction that persisted them has committed.
+	notifier AlertNotifier
 }
+
+// SetNotifier wires an outbound alert channel (e.g. Telegram).
+func (s *Store) SetNotifier(n AlertNotifier) { s.notifier = n }
 
 func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{
@@ -131,6 +137,7 @@ func (s *Store) Tick() ([]*Machine, error) {
 	defer tx.Rollback(ctx) // no-op once committed
 
 	now := time.Now()
+	var created []Alert
 	for _, m := range machines {
 		if m.Status == StatusOffline || m.Status == StatusMaintenance {
 			continue
@@ -203,12 +210,18 @@ func (s *Store) Tick() ([]*Machine, error) {
 			logger.Error("tick: insert history", "error", err, "id", m.ID)
 		}
 
-		s.checkThresholdAlerts(ctx, tx, m, thresholds)
-		s.checkMaintenanceDueAlert(ctx, tx, m)
+		created = append(created, s.checkThresholdAlerts(ctx, tx, m, thresholds)...)
+		created = append(created, s.checkMaintenanceDueAlert(ctx, tx, m)...)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		logger.Error("tick: commit", "error", err)
+		return machines, nil // the alerts were rolled back — don't announce them
+	}
+	if s.notifier != nil {
+		for _, a := range created {
+			s.notifier.Notify(a)
+		}
 	}
 	return machines, nil
 }
@@ -251,7 +264,8 @@ func (s *Store) updateStatus(m *Machine) {
 // anomaly_detected remain seed-only for now — those need a different
 // signal (connectivity loss, scheduled maintenance, statistical outlier
 // detection) than a simple threshold crossing.
-func (s *Store) checkThresholdAlerts(ctx context.Context, tx pgx.Tx, m *Machine, thresholds []*AlertThreshold) {
+func (s *Store) checkThresholdAlerts(ctx context.Context, tx pgx.Tx, m *Machine, thresholds []*AlertThreshold) []Alert {
+	var created []Alert
 	for _, th := range thresholds {
 		value, ok := thresholdMetricValue(m, th.Metric)
 		if !ok {
@@ -269,10 +283,15 @@ func (s *Store) checkThresholdAlerts(ctx context.Context, tx pgx.Tx, m *Machine,
 			continue // within normal range
 		}
 
+		// A warning already open must not hide the metric later turning
+		// critical (nobody would be told), so a critical crossing is only
+		// suppressed by an open *critical* alert; a warning is suppressed
+		// by any open alert on the metric.
 		var alreadyOpen bool
 		err := tx.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM alerts WHERE machine_id=$1 AND metric_name=$2 AND acknowledged=false)`,
-			m.ID, th.Metric,
+			`SELECT EXISTS(SELECT 1 FROM alerts WHERE machine_id=$1 AND metric_name=$2 AND acknowledged=false
+				AND ($3 = 'warning' OR severity = 'critical'))`,
+			m.ID, th.Metric, string(severity),
 		).Scan(&alreadyOpen)
 		if err != nil {
 			logger.Error("tick: check open alert", "error", err, "machineId", m.ID, "metric", th.Metric)
@@ -284,14 +303,22 @@ func (s *Store) checkThresholdAlerts(ctx context.Context, tx pgx.Tx, m *Machine,
 
 		message := fmt.Sprintf("%s: %s превысила %s порог (%.1f %s)",
 			m.Name, th.Label, severityRuLabel(severity), value, th.Unit)
+		alert := Alert{
+			ID: newAlertID(), MachineID: m.ID, MachineName: m.Name, Type: AlertThresholdExceeded, Severity: severity,
+			Message: message, MetricName: th.Metric, CurrentValue: value, ThresholdValue: thresholdValue, Timestamp: time.Now(),
+		}
 		_, err = tx.Exec(ctx, `INSERT INTO alerts
 			(id, machine_id, machine_name, type, severity, message, metric_name, current_value, threshold_value, timestamp, acknowledged)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false)`,
-			newAlertID(), m.ID, m.Name, AlertThresholdExceeded, severity, message, th.Metric, value, thresholdValue, time.Now())
+			alert.ID, alert.MachineID, alert.MachineName, alert.Type, alert.Severity, alert.Message, alert.MetricName,
+			alert.CurrentValue, alert.ThresholdValue, alert.Timestamp)
 		if err != nil {
 			logger.Error("tick: insert alert", "error", err, "machineId", m.ID, "metric", th.Metric)
+			continue
 		}
+		created = append(created, alert)
 	}
+	return created
 }
 
 func thresholdMetricValue(m *Machine, metric string) (float64, bool) {
@@ -334,13 +361,13 @@ const maintenanceDueWindow = 48 * time.Hour
 // NextMaintenanceAt falls within maintenanceDueWindow — this is the first
 // thing that actually uses that alert type; previously it existed only in
 // the seed data and nothing ever generated one at runtime.
-func (s *Store) checkMaintenanceDueAlert(ctx context.Context, tx pgx.Tx, m *Machine) {
+func (s *Store) checkMaintenanceDueAlert(ctx context.Context, tx pgx.Tx, m *Machine) []Alert {
 	if m.NextMaintenanceAt == nil {
-		return
+		return nil
 	}
 	until := time.Until(*m.NextMaintenanceAt)
 	if until > maintenanceDueWindow || until < -maintenanceDueWindow {
-		return
+		return nil
 	}
 
 	var alreadyOpen bool
@@ -350,20 +377,27 @@ func (s *Store) checkMaintenanceDueAlert(ctx context.Context, tx pgx.Tx, m *Mach
 	).Scan(&alreadyOpen)
 	if err != nil {
 		logger.Error("tick: check maintenance alert", "error", err, "machineId", m.ID)
-		return
+		return nil
 	}
 	if alreadyOpen {
-		return
+		return nil
 	}
 
 	message := fmt.Sprintf("%s: плановое ТО назначено на %s", m.Name, m.NextMaintenanceAt.Format("02.01.2006 15:04"))
+	alert := Alert{
+		ID: newAlertID(), MachineID: m.ID, MachineName: m.Name, Type: AlertMaintenanceDue, Severity: SeverityInfo,
+		Message: message, MetricName: "uptime", Timestamp: time.Now(),
+	}
 	_, err = tx.Exec(ctx, `INSERT INTO alerts
 		(id, machine_id, machine_name, type, severity, message, metric_name, current_value, threshold_value, timestamp, acknowledged)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false)`,
-		newAlertID(), m.ID, m.Name, AlertMaintenanceDue, SeverityInfo, message, "uptime", 0, 0, time.Now())
+		alert.ID, alert.MachineID, alert.MachineName, alert.Type, alert.Severity, alert.Message, alert.MetricName,
+		0, 0, alert.Timestamp)
 	if err != nil {
 		logger.Error("tick: insert maintenance alert", "error", err, "machineId", m.ID)
+		return nil
 	}
+	return []Alert{alert}
 }
 
 // ── History ──────────────────────────────────────────────────────────
