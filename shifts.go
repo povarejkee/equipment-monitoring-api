@@ -304,11 +304,11 @@ func scopedMachineSelection(user *User, all []*Machine, requested []string) []*M
 	return out
 }
 
-func (s *Server) handleShiftReport(w http.ResponseWriter, r *http.Request) {
-	loc := shiftLocation()
-	now := time.Now().In(loc)
+// dayRangeFromQuery parses dateFrom/dateTo (YYYY-MM-DD, plant timezone;
+// both default to today) and enforces the range limits. On failure it has
+// already written the 400 and returns ok=false.
+func dayRangeFromQuery(w http.ResponseWriter, r *http.Request, loc *time.Location, now time.Time) (fromDay, toDay time.Time, ok bool) {
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-
 	parseDay := func(key string, def time.Time) (time.Time, bool) {
 		v := r.URL.Query().Get(key)
 		if v == "" {
@@ -321,14 +321,24 @@ func (s *Server) handleShiftReport(w http.ResponseWriter, r *http.Request) {
 	fromDay, ok2 := parseDay("dateFrom", toDay)
 	if !ok1 || !ok2 {
 		writeError(w, http.StatusBadRequest, "Даты должны быть в формате ГГГГ-ММ-ДД")
-		return
+		return time.Time{}, time.Time{}, false
 	}
 	if fromDay.After(toDay) {
 		writeError(w, http.StatusBadRequest, "Начальная дата позже конечной")
-		return
+		return time.Time{}, time.Time{}, false
 	}
 	if days := int(toDay.Sub(fromDay).Hours()/24) + 1; days > maxShiftReportDays {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("Максимальный период — %d дней", maxShiftReportDays))
+		return time.Time{}, time.Time{}, false
+	}
+	return fromDay, toDay, true
+}
+
+func (s *Server) handleShiftReport(w http.ResponseWriter, r *http.Request) {
+	loc := shiftLocation()
+	now := time.Now().In(loc)
+	fromDay, toDay, ok := dayRangeFromQuery(w, r, loc, now)
+	if !ok {
 		return
 	}
 

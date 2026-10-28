@@ -61,7 +61,7 @@ func main() {
 	defer tx.Rollback(ctx)
 
 	if _, err := tx.Exec(ctx,
-		`TRUNCATE users, machines, alerts, error_log, metric_history, downtimes, thresholds RESTART IDENTITY CASCADE`,
+		`TRUNCATE users, machines, alerts, error_log, metric_history, downtimes, thresholds, scrap_records RESTART IDENTITY CASCADE`,
 	); err != nil {
 		fmt.Fprintf(os.Stderr, "truncate: %v\n", err)
 		os.Exit(1)
@@ -76,6 +76,7 @@ func main() {
 	for _, m := range machines {
 		seedDowntimes(ctx, tx, rng, m.id)
 		seedHistory(ctx, tx, rng, m.id)
+		seedScrap(ctx, tx, rng, m.id)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -179,10 +180,10 @@ func seedMachines(ctx context.Context, tx pgx.Tx, rng *rand.Rand) []seededMachin
 
 		mustExec(ctx, tx, `INSERT INTO machines
 			(id, name, type, location, status, assigned_operator, temperature, load, output, uptime,
-			 power_consumption, spindle_speed, vibration, last_updated)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			 power_consumption, spindle_speed, vibration, last_updated, rated_output)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
 			sp.id, sp.name, sp.typ, sp.location, sp.status, sp.op, round1(temp), round1(load), output, uptime,
-			power, spindleSpeed, round1(vibration), time.Now())
+			power, spindleSpeed, round1(vibration), time.Now(), ratedOutputByType[sp.typ])
 
 		out = append(out, seededMachine{id: sp.id, name: sp.name})
 	}
@@ -325,6 +326,42 @@ func seedHistory(ctx context.Context, tx pgx.Tx, rng *rand.Rand, machineID strin
 	if err := br.Close(); err != nil {
 		fmt.Fprintf(os.Stderr, "seed history for %s: %v\n", machineID, err)
 		os.Exit(1)
+	}
+}
+
+// ── scrap ────────────────────────────────────────────────────────────
+
+// ratedOutputByType matches the defaults migration 0004 applies (parts/hour).
+var ratedOutputByType = map[string]float64{
+	"cnc": 48, "lathe": 50, "milling": 46, "grinding": 44, "press": 55,
+}
+
+// seedScrap logs 1–3 scrap entries a day for 30 days, sized so each
+// machine ends up with its own 0.5–3.5% reject rate (so quality, and OEE,
+// differ between machines in the demo).
+func seedScrap(ctx context.Context, tx pgx.Tx, rng *rand.Rand, machineID string) {
+	reasons := []string{"Размер вне допуска", "Дефект поверхности", "Трещина", "Заусенцы", "Износ инструмента"}
+	rate := 0.005 + rng.Float64()*0.03
+	now := time.Now()
+	for day := 30; day >= 0; day-- {
+		total := int(math.Round(480 * rate))
+		entries := 1 + rng.Intn(3)
+		for e := 0; e < entries; e++ {
+			count := total / entries
+			if e == 0 {
+				count += total % entries
+			}
+			if count <= 0 {
+				continue
+			}
+			at := now.Add(-time.Duration(day)*24*time.Hour - time.Duration(rng.Intn(20*60))*time.Minute)
+			if at.After(now) {
+				at = now
+			}
+			mustExec(ctx, tx, `INSERT INTO scrap_records (id, machine_id, count, reason, occurred_at)
+				VALUES ($1,$2,$3,$4,$5)`,
+				fmt.Sprintf("scrap-%s-%d-%d", machineID, day, e), machineID, count, reasons[rng.Intn(len(reasons))], at)
+		}
 	}
 }
 

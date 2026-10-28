@@ -37,7 +37,7 @@ func NewStore(pool *pgxpool.Pool) *Store {
 
 const machineColumns = `id, name, type, location, status, assigned_operator,
 	temperature, load, output, uptime, power_consumption, spindle_speed, vibration, last_updated,
-	next_maintenance_at`
+	next_maintenance_at, rated_output`
 
 func scanMachine(row pgx.Row) (*Machine, error) {
 	var m Machine
@@ -46,7 +46,7 @@ func scanMachine(row pgx.Row) (*Machine, error) {
 		&m.ID, &m.Name, &m.Type, &m.Location, &m.Status, &assignedOperator,
 		&m.Metrics.Temperature, &m.Metrics.Load, &m.Metrics.Output, &m.Metrics.Uptime, &m.Metrics.PowerConsumption,
 		&m.Metrics.SpindleSpeed, &m.Metrics.Vibration, &m.LastUpdated,
-		&m.NextMaintenanceAt,
+		&m.NextMaintenanceAt, &m.RatedOutput,
 	)
 	if err != nil {
 		return nil, err

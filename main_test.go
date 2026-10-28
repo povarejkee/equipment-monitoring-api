@@ -55,7 +55,7 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	}
 	ctx := context.Background()
 	if _, err := testPool.Exec(ctx,
-		`TRUNCATE users, machines, alerts, error_log, metric_history, downtimes, thresholds, sessions RESTART IDENTITY CASCADE`,
+		`TRUNCATE users, machines, alerts, error_log, metric_history, downtimes, thresholds, sessions, scrap_records RESTART IDENTITY CASCADE`,
 	); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}

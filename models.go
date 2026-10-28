@@ -45,6 +45,7 @@ type Machine struct {
 	LastUpdated       time.Time      `json:"lastUpdated"`
 	AssignedOperator  string         `json:"assignedOperator,omitempty"`
 	NextMaintenanceAt *time.Time     `json:"nextMaintenanceAt,omitempty"`
+	RatedOutput       float64        `json:"ratedOutput"`
 }
 
 type MetricHistoryPoint struct {
