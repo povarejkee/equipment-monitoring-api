@@ -413,6 +413,25 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Некорректный запрос")
 		return
 	}
+	// Operators only get reports for their own machines — an empty
+	// MachineIDs means "all machines", which must not reach them.
+	if user := userFromContext(r); user != nil && user.Role == RoleOperator {
+		allowed := make([]string, 0, len(p.MachineIDs))
+		source := p.MachineIDs
+		if len(source) == 0 {
+			source = user.AssignedMachines
+		}
+		for _, id := range source {
+			if canAccessMachine(user, id) {
+				allowed = append(allowed, id)
+			}
+		}
+		if len(allowed) == 0 {
+			writeForbiddenMachine(w)
+			return
+		}
+		p.MachineIDs = allowed
+	}
 	report, err := s.store.GenerateReport(p)
 	if err != nil {
 		writeDBError(w, "generate report", err)
