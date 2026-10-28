@@ -38,7 +38,8 @@ Env vars:
   `Europe/Moscow`).
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — enable Telegram alert
   notifications (see [Telegram notifications](#telegram-notifications));
-  `TELEGRAM_MIN_SEVERITY` = `critical` (default) | `warning` | `info`.
+  `TELEGRAM_MIN_SEVERITY` = `critical` (default) | `warning` | `info`;
+  `TELEGRAM_API_BASE` overrides `https://api.telegram.org`.
 
 ## Database
 

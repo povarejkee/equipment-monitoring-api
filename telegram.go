@@ -38,7 +38,9 @@ type TelegramStatus struct {
 
 // TelegramNotifier pushes alerts to a Telegram chat. Configured entirely
 // by environment (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, optional
-// TELEGRAM_MIN_SEVERITY = critical|warning|info, default critical); with
+// TELEGRAM_MIN_SEVERITY = critical|warning|info, default critical;
+// TELEGRAM_API_BASE overrides https://api.telegram.org, e.g. for a
+// self-hosted Bot API server); with
 // no token/chat it is disabled and Notify is a no-op.
 type TelegramNotifier struct {
 	token       string
@@ -65,6 +67,9 @@ func NewTelegramNotifierFromEnv() *TelegramNotifier {
 		client:      &http.Client{Timeout: 10 * time.Second},
 		retryDelay:  time.Second,
 		queue:       make(chan Alert, telegramQueueSize),
+	}
+	if v := strings.TrimSpace(os.Getenv("TELEGRAM_API_BASE")); v != "" {
+		n.baseURL = strings.TrimRight(v, "/")
 	}
 	switch AlertSeverity(strings.ToLower(strings.TrimSpace(os.Getenv("TELEGRAM_MIN_SEVERITY")))) {
 	case SeverityWarning:
